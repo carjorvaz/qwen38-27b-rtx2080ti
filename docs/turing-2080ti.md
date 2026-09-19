@@ -1,0 +1,172 @@
+# Turing (SM75): Qwen3.8-27B on a 22 GB RTX 2080 Ti
+
+This branch adds a Turing port to the 3090 stack. `patches-turing/` is a
+19-patch series applied after `patches/`, on the same vLLM 0.28.0, and it runs the same
+serving setup on a card that is 8 GB smaller and one generation older: an RTX 2080 Ti with 22 GB, running at 280 W (the card's
+factory cap is 250 W).
+
+The short version: 262,144 tokens of context out of a 5.5 GiB int4 KV pool,
+112 tok/s single-stream decode at 2k and 66 tok/s at 128k, with MTP speculation
+and prefix caching. Everything below is measured on that card, single stream,
+with the launch flags in [Running it](#running-it). The 3090 numbers elsewhere
+in this repo are upstream's and are not re-measured here.
+
+## What SM75 is missing, and what replaces it
+
+| 3090 (SM86) has | Turing (SM75) instead |
+| --- | --- |
+| fp8 GEMM and fp8 KV | nothing: int4 KV with per-token-head scales and zero points, fp16/fp32 dots (no int4 tensor cores either) |
+| 99 KiB shared memory per SM | 64 KiB, which rules out the fp16 flash-attention tile and the dense Hadamard matrices at head_dim 256 |
+| `m16n8k16` int8/int4 paths, hadacore | fp16 MMA for every dot; a butterfly Hadamard kernel that gathers the rotation into registers instead of shared memory |
+| FA2-style prefill at head_dim 256 | a Cutlass memory-efficient-attention port with 256-key tiles and 64 queries per CTA, fp32 accumulators |
+| `chunk_gated_delta_rule` kernels for SM80+ | an SM75 chunk-state kernel: fp16 MMA operands, fp32 recurrent state in registers |
+
+The port is specific to head_dim 256 and to the packed `int4_per_token_head`
+layout; other shapes fall back to the paths they already had.
+
+## The series
+
+Applied in `patches-turing/series` order. Measurements are single-stream decode
+on real text unless noted; "correctness" means the patch fixes a path that
+otherwise produces wrong results or does not run.
+
+| patch | what it does | result |
+| --- | --- | --- |
+| `fp16-attn-verify` | prefill attention in fp16 with a packed-KV workspace | enables prefill at all on SM75 |
+| `fp16-drafter-units` | power-of-two unit shift so a bf16 checkpoint runs in fp16 | drafter loads without overflow |
+| `gdn-chunk-state` | chunked gated-delta-rule state update for SM75 | correctness on Turing |
+| `mamba-block-retirement` | frees the null gaps mamba prefill leaves | correctness (pool leak) |
+| `spec-decode-mma` | the verify attention kernel: fp16 MMA, split-KV, in-kernel dequant | the speculative path runs on Turing |
+| `mtp-history-lookup` | drafts from the context when the tail is already in it | 60k "reproduce this" 78.4 -> 90 tok/s, exact |
+| `mtp-prefix-checkpoint` | checkpoints recurrent state where prefix caching matched | correctness (prefix caching with a hybrid model) |
+| `packed-int4-kv` | asymmetric int4 KV, per-(token, head) zero points | 262k context in 5.5 GiB |
+| `prefill-attn-dispatch` | keeps short prefills off the decode graph | correctness (recurrent-state init) |
+| `prefill-attn-tiles` | the SM75 tile kernel, constants measured | tail prefill 464 tok/s at 64k, 240 at 248k |
+| `int4-kv-hadamard` | butterfly Hadamard for the int4 quantizer | +5.5% at 6k, +3.5% at 32k context |
+| `spec-attn-nseg` | split-KV segments as a knob | tuning, default 32 |
+| `spec-attn-staging` | vectorized int4 staging in the verify kernel | 64k 42.9 -> 72.6 tok/s, 128k 24.0 -> 49.1 |
+| `int4-attn-fp16-dots` | fp16 dots for the int4 attention | ~2% at 64k, perplexity unchanged |
+| `spec-attn-scratch-cap` | bounds the 3D-scratch workspace | correctness at large blocks |
+| `sampling-log` | logs effective sampling parameters per request | tooling; explains why greedy-only lookup drafting |
+| `vllm-*` (3) | backports from vLLM after 0.28.0: SSE keep-alive, engine stall sentinel, completion log | operational |
+
+## Running it
+
+Install vLLM 0.28.0, apply both patch directories (`patches-turing/README.md`
+has the command), and launch with the flags this was measured with:
+
+```bash
+vllm serve models/Qwen3.8-27B-W4A16-AutoRound \
+  --served-model-name qwen3.8-27b --dtype float16 --language-model-only \
+  --attention-backend TRITON_ATTN \
+  --kv-cache-dtype int4_per_token_head \
+  --mamba-cache-dtype float16 --mamba-ssm-cache-dtype float16 --mamba-cache-mode align \
+  --kv-cache-memory 5905580032 --max-model-len 262144 \
+  --max-num-seqs 1 --max-num-batched-tokens 2048 \
+  --enable-prefix-caching --prefix-match-unit 16 \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":4,"attention_backend":"TRITON_ATTN","draft_sample_method":"probabilistic"}' \
+  --compilation-config '{"mode":"VLLM_COMPILE","cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["+rms_norm","+silu_and_mul"],"max_cudagraph_capture_size":8}' \
+  --async-scheduling --sse-keep-alive-interval 30
+```
+
+`--kv-cache-memory 5905580032` is the whole budget the card has for KV at this
+context: raise it for a longer context, lower it if the model does not load.
+`--load-format runai_streamer` with `--model-loader-extra-config
+'{"concurrency":2,"memory_limit":1610612736}'` is worth adding on a host with
+little RAM; it made the difference between a clean load and an OOM kill on an
+8 GB host.
+
+Knobs this series adds, all optional:
+
+| variable | default | effect |
+| --- | --- | --- |
+| `VLLM_MTP_LOOKUP` | `0` | enable the context-lookup drafts (greedy requests only) |
+| `VLLM_MTP_LOOKUP_MIN` | `24` | shortest tail worth looking up |
+| `VLLM_MTP_LOOKUP_SAMPLED` | `0` | allow the lookup on sampled requests too |
+| `VLLM_TURING_PREFILL_TILE` | `256` | key-tile width for the prefill kernel; `0` selects the portable fallback |
+| `VLLM_TURING_SPEC_NSEG` | `32` | split-KV partials in the verify attention |
+| `VLLM_TURING_GDN_STATE` | `1` | `0` restores the upstream chunk-state path |
+| `VLLM_SAMPLING_LOG` | `0` | per-request client address, prompt digest and sampling parameters |
+| `VLLM_ENGINE_STALL_SENTINEL_S` | unset | seconds without an engine iteration before it logs and aborts |
+
+## Measurements
+
+Single stream, MTP k=4 with the context lookup, real text prompts (wikitext-2
+test), 128-192 output tokens, greedy. Decode rate excludes prefill.
+
+| context | decode tok/s | ms per step |
+| --- | --- | --- |
+| 2k | 112.3 | 33.8 |
+| 8k | 97.7 | 36.2 |
+| 32k | 96.6 | 39.8 |
+| 64k | 71.6 | 45.8 |
+| 128k | 65.6 | 57.6 |
+
+A step is ~24 ms of weight reads at every depth; speculation adds 4.5 ms of
+draft work at 2k and 7.7 ms at 64k, and the verify attention adds ~5 ms at 64k.
+The 64k and 128k rows are well above what the same configuration does without
+the vectorized int4 staging (42.9 and 24.0 tok/s).
+
+Prefill, which is what a long turn actually costs:
+
+| context | tail prefill tok/s |
+| --- | --- |
+| 32k | 624 |
+| 64k | 464 |
+| 248k | ~240 |
+
+A fully cached 246k-token turn takes 8.5 s. Five scenarios at 248k were run
+end to end (cold prefill, cached replay of the same turn, replacement of the
+cached prefix, recompute after a mismatch, and a short request); all completed
+with zero preemptions. Attention runs at 32 TFLOPS effective
+there, 60-70% of what fp16 with fp32 accumulation can reach on this part, so the
+tail is close to what this generation of hardware does.
+
+Quality: 10.8797 perplexity on wikitext-2 test (en 10.8077, da 10.938) and 94.5%
+on GSM8K (n=200), with the int4 KV cache in place. To separate the KV precision
+from the weights, the same server was run with an fp16 KV cache on the same
+5.5 GiB pool (65k context instead of 262k): 10.8451 perplexity and 95.5% GSM8K.
+The 4-bit cache costs about 0.3% perplexity, with the GSM8K difference inside
+the noise of 200 questions.
+
+## Measured and rejected
+
+Kept here so nobody re-derives them:
+
+- **Longer verify blocks** (static k=8, and an adaptive block that asks the
+  scheduler for more tokens when a step is fully accepted). k=8 is worth +16 to
+  +38% on chat-like traffic, but wide verify at depth costs more than the extra
+  tokens return: five variants of the adaptive block all lost end to end.
+- **Windowing the drafter's attention** to 4096 tokens, on the theory that a
+  local prediction does not need the whole context. The windowed path is 25%
+  slower per step at 8k and faults at 64k, because the staged int4 kernel
+  indexes the block table assuming a full-causal layout.
+- **warpN=32 or 128 in the prefill tile**: the first does not compile, the
+  second is 5x slower. Two blocks per SM gained 3% at 64k and nothing at depth.
+
+## Known limits
+
+- The port assumes head_dim 256 and `int4_per_token_head`. Other shapes take
+  the paths they already had, which on SM75 means slower or absent.
+- No fp8 anywhere: no fp8 KV, no fp8 GEMM. `int4_per_token_head` is the only way
+  to reach 262k on this card.
+- Single stream only: these numbers are `max-num-seqs=1`. Serving several
+  streams needs a second KV pool, about 5.97 GiB beyond what the card has spare
+  at 262k.
+- The Docker and compose paths in this repo build for the 3090's CUDA arch
+  list; they are not wired for Turing. Apply the series to a local vLLM 0.28.0
+  environment instead.
+- The int4 3D-scratch attention variant boots but is not faster here; its
+  workspace is capped so a large block cannot over-allocate.
+- One hardware note: an early long run at 280 W produced Xid 45 on our card.
+  It has not recurred in multi-hour soaks at the same settings since, and we run
+  a power-limit service and a watchdog, but the cause is unexplained. The
+  numbers above are at 280 W; the unlock was measured at +1.6%, inside the
+  noise of a single run, so it is not what any of them depend on.
+
+## Credit
+
+Fork of [syv-ai/HyperQwen](https://github.com/syv-ai/HyperQwen) (formerly
+`syv-ai/qwen38-27b-rtx3090`), whose 3090 stack, preparation scripts and
+benchmark harness this series builds on and does not replace. The patches here modify vLLM 0.28.0; both are
+Apache-2.0, see `LICENSE`.
