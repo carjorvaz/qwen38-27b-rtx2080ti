@@ -4,7 +4,8 @@ Extends the `int4_per_token_head` layout to SM75: asymmetric int4 with
 per-(token, head) scales and zero points, dequantized inside the attention
 kernels (fp16 dots, fp32 zero-point corrections) and materialized per step for
 the prefill and verify paths. This is what lets 262,144 tokens of context live
-in 5.5 GiB here; Turing has no int4 tensor cores, so every dot is fp16 or fp32.
+in 5.5 GiB here. These kernels use fp16/fp32 dots; Turing's integer tensor
+cores require a different kernel layout and are not used by this patch.
 
 --- a/v1/attention/ops/turing_spec_attn.cu
 +++ b/v1/attention/ops/turing_spec_attn.cu

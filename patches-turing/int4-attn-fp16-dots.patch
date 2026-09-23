@@ -1,6 +1,6 @@
 Do the packed-int4 attention dots in fp16, not fp32.
 
-SM75 has no int4 tensor cores, so the kernel dequantized nibbles into fp32 and
+This SM75 kernel does not use integer MMA, so it dequantized nibbles into fp32 and
 fed fp32 dots, and the fp32 K/V tiles filled half of shared memory. The nibbles
 are 0..15 and exactly representable in fp16, so the dots run in fp16 with fp32
 accumulation while the zero-point corrections stay in fp32. Halves the tile

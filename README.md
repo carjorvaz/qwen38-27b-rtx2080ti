@@ -14,15 +14,17 @@ API with key auth, in two ready-made modes.
 
 ## Turing (SM75) support
 
-`patches-turing/` is a 19-patch series applied after `patches/`. It ports the
+`patches-turing/` is a 21-patch series applied after `patches/`. It ports the
 same serving setup to Turing, so an RTX 2080 Ti 22 GB serves 262,144 tokens of
 context out of a 5.5 GiB int4 KV pool, at 112 tok/s single-stream decode at 2k
-and 66 tok/s at 128k. Where SM75 has no fp8, no int4 tensor cores, no 99 KiB
-shared-memory tile and no hadacore, the series substitutes fp16 MMA kernels, a
+and 66 tok/s at 128k. Where the newer stack needs native bf16, a 99 KiB
+shared-memory tile or hadacore, the series substitutes fp16 MMA kernels, a
 packed int4 KV layout with per-token-head zero points, a butterfly Hadamard
 quantizer and a Cutlass prefill attention port. Patch-by-patch detail and the
 measurements, including what was tried and rejected:
-[docs/turing-2080ti.md](docs/turing-2080ti.md).
+[docs/turing-2080ti.md](docs/turing-2080ti.md). Optional bounded-memory prefill,
+short-extension attention, and prefill-only W4A8 experiments:
+[docs/turing-prefill.md](docs/turing-prefill.md).
 
 ## Quick start
 

@@ -17,3 +17,5 @@ sampling-log.patch
 vllm-engine-completion-log.patch
 vllm-engine-stall-sentinel.patch
 vllm-sse-keep-alive.patch
+prefill-memory-and-extend.patch
+marlin-prefill-only-int8.patch

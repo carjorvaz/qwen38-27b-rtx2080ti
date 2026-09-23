@@ -1,0 +1,416 @@
+Optional bounded-workspace prefill and small-query extensions on SM75.
+
+VLLM_TURING_PREFILL_WINDOW=16384 limits FP16 KV staging to 64 MiB; a
+pre-profiled FP32 accumulator and LSE merge windows without changing the
+attention mask. Earlier windows are fully visible; the final window contains
+all query tokens and uses lower-right causality. The 2048-query accumulator
+adds 48 MiB. Default 0 retains the original full-context workspace.
+
+VLLM_TURING_EXTEND_MAX=32 uses separately preallocated packed split-KV scratch
+for short extensions, without changing speculative QMAX or replaying a decode
+model graph. It consumes the live prefill metadata; recurrent-state init is
+untouched. Default 0 retains the original dispatch.
+
+Explicit FP32 Hadamard signs are essential: preallocation runs while model
+loading has set the default dtype to FP16. All workspace is allocated before
+memory profiling, and the knobs participate in vLLM's compilation-cache hash.
+
+Requires the preceding Turing series. Numeric/replay tests:
+  python bench/test_turing_prefill.py
+Measured performance and remaining limits: docs/turing-prefill.md.
+
+--- a/envs.py
++++ b/envs.py
+@@ -185,6 +185,8 @@
+     VLLM_RAY_EXTRA_ENV_VARS_TO_COPY: str = ""
+     VLLM_MARLIN_USE_ATOMIC_ADD: bool = False
+     VLLM_MARLIN_INPUT_DTYPE: Literal["int8", "fp8"] | None = None
++    VLLM_TURING_PREFILL_WINDOW: int = 0
++    VLLM_TURING_EXTEND_MAX: int = 0
+     VLLM_MARLIN_INT8_INCLUDE_RE: str = ""
+     VLLM_MARLIN_INT8_EXCLUDE_RE: str = "lm_head|mtp"
+     VLLM_HUMMING_ONLINE_QUANT_CONFIG: dict[str, Any] | None = None
+@@ -1532,6 +1534,10 @@
+     ),
+     # syv patch: per-layer regex selection for the Marlin int8/fp8 activation
+     # path (registered here so they take part in the torch.compile cache key)
++    # These affect compiled/captured execution. Register them so compile_factors
++    # separates artifacts when switching between baseline and SM75 experiments.
++    "VLLM_TURING_PREFILL_WINDOW": lambda: int(os.environ.get("VLLM_TURING_PREFILL_WINDOW", "0")),
++    "VLLM_TURING_EXTEND_MAX": lambda: int(os.environ.get("VLLM_TURING_EXTEND_MAX", "0")),
+     "VLLM_MARLIN_INT8_INCLUDE_RE": lambda: os.environ.get(
+         "VLLM_MARLIN_INT8_INCLUDE_RE", ""
+     ),
+--- a/v1/attention/ops/int4_per_token_head.py
++++ b/v1/attention/ops/int4_per_token_head.py
+@@ -1377,7 +1377,9 @@
+         gen = torch.Generator(device="cpu")
+         gen.manual_seed(0x9E3779B9 + round_idx * 0x517CC1B7)
+         signs = (
+-            2.0 * torch.bernoulli(torch.full((d,), 0.5, device="cpu"), generator=gen)
++            2.0 * torch.bernoulli(
++                torch.full((d,), 0.5, dtype=torch.float32, device="cpu"), generator=gen
++            )
+             - 1.0
+         )
+         _RHT_SIGNS_CACHE[key] = signs.to(device)
+--- a/v1/attention/ops/turing_prefill_attn.py
++++ b/v1/attention/ops/turing_prefill_attn.py
+@@ -5,6 +5,8 @@
+ avoids both those spills and an unbounded per-layer dequantization allocation.
+ Decode and multi-request batches retain their existing paged kernels.
+ """
++import os
++
+ import torch
+ import triton
+ import triton.language as tl
+@@ -43,9 +45,10 @@
+     QUANT: tl.constexpr,
+     PACKED: tl.constexpr,
+     ROWS: tl.constexpr,
++    start=0,
+ ):
+     head = tl.program_id(1)
+-    pos = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
++    pos = start + tl.program_id(0) * ROWS + tl.arange(0, ROWS)
+     dim = tl.arange(0, D)
+     valid = pos < n
+     block = tl.load(table + pos // BLOCK, mask=valid, other=0)
+@@ -84,24 +87,60 @@
+             vval = ((vval.to(tl.int32) >> shift) & 15) - vzero[:, None]
+         kval = kval.to(tl.float32) * kscale[:, None]
+         vval = vval.to(tl.float32) * vscale[:, None]
+-    offset = (head * capacity + pos[:, None]) * D + dim[None, :]
++    offset = (head * capacity + (pos - start)[:, None]) * D + dim[None, :]
+     tl.store(dst_k + offset, kval, mask=valid[:, None])
+     tl.store(dst_v + offset, vval, mask=valid[:, None])
+ 
+ 
+ class TuringPrefillAttention:
+-    def __init__(self, capacity, num_kv_heads, head_dim, device):
++    def __init__(self, capacity, num_kv_heads, head_dim, device,
++                 num_heads=None, max_queries=2048):
+         self.capacity = capacity
+         self.num_kv_heads = num_kv_heads
+         self.head_dim = head_dim
++        self.stream_tokens = int(os.environ.get("VLLM_TURING_PREFILL_WINDOW", "0"))
++        if self.stream_tokens and os.environ.get("VLLM_TURING_PREFILL_TILE", "256") != "256":
++            raise ValueError("windowed prefill requires VLLM_TURING_PREFILL_TILE=256")
++        if self.stream_tokens and (
++            self.stream_tokens < max_queries or self.stream_tokens % 256 or num_heads is None
++        ):
++            raise ValueError("prefill window must be a multiple of 256, >= max batched tokens; num_heads required")
++        storage_capacity = min(capacity, self.stream_tokens) if self.stream_tokens else capacity
+         self.storage = torch.empty(
+-            (2, num_kv_heads, capacity, head_dim), dtype=torch.float16, device=device
++            (2, num_kv_heads, storage_capacity, head_dim), dtype=torch.float16, device=device
+         )
+         self.key, self.value = self.storage.unbind(0)
+         self.shape = None
++        if self.stream_tokens:
++            self.stream_accum = torch.empty((max_queries, num_heads, head_dim), dtype=torch.float32, device=device)
++            self.stream_lse = torch.empty((max_queries, num_heads), dtype=torch.float32, device=device)
++        self.extend = None
++        extend_max = int(os.environ.get("VLLM_TURING_EXTEND_MAX", "0"))
++        if not 0 <= extend_max <= 64:
++            raise ValueError("VLLM_TURING_EXTEND_MAX must be between 0 and 64")
++        if (extend_max and num_heads is not None and head_dim == 256
++                and num_heads % num_kv_heads == 0
++                and 1 <= num_heads // num_kv_heads <= 32):
++            from .spec_decode_attn import SpecDecodeAttention
++            self.extend = SpecDecodeAttention(1, num_heads, head_dim, device,
++                                               extend_max, num_segments=32, packed_int4=True)
++            self.extend_cu = torch.tensor([0, 0], dtype=torch.int32, device=device)
++            self.extend_used = torch.tensor([0], dtype=torch.int32, device=device)
++
++    @property
++    def workspace_bytes(self):
++        total = self.storage.nbytes
++        if self.stream_tokens:
++            total += self.stream_accum.nbytes + self.stream_lse.nbytes
++        if self.extend is not None:
++            total += sum(t.nbytes for t in (
++                self.extend.part_o, self.extend.part_m, self.extend.part_l,
++                self.extend.rotated_query, self.extend.rotated_output,
++                self.extend_cu, self.extend_used))
++        return total
+ 
+     def run(self, q, k, v, out, block_table, num_keys, scale,
+-            k_scale_cache=None, v_scale_cache=None):
++            k_scale_cache=None, v_scale_cache=None, cu_seqlens_q=None, seqused_k=None):
+         num_queries, num_heads, dim = q.shape
+         assert 0 < num_queries <= num_keys <= self.capacity
+         assert dim == self.head_dim and num_heads % self.num_kv_heads == 0
+@@ -115,6 +154,21 @@
+             == (torch.uint8 if packed else torch.int8 if quant else torch.float16)
+         )
+         assert not packed or (quant and dim == 256)
++        if (packed and self.extend is not None and num_queries <= self.extend.qmax
++                and k.shape[1] % 16 == 0):
++            if cu_seqlens_q is None:
++                self.extend_cu[1].fill_(num_queries)
++                cu_seqlens_q = self.extend_cu
++            if seqused_k is None:
++                self.extend_used.fill_(num_keys)
++                seqused_k = self.extend_used
++            return self.extend.run(q, k, v, out, cu_seqlens_q, seqused_k,
++                                   block_table, scale, 1, num_queries,
++                                   k_scale_cache, v_scale_cache)
++        if self.stream_tokens:
++            from .turing_prefill_stream import stream_prefill
++            return stream_prefill(self, q, k, v, out, block_table, num_keys, scale,
++                                  k_scale_cache, v_scale_cache)
+         if packed:
+             from vllm.v1.attention.ops.int4_per_token_head import _get_rht_signs
+             from vllm.v1.attention.ops.turing_spec_attn import load_turing_rht
+@@ -172,10 +226,12 @@
+ _WORKSPACES = {}
+ 
+ 
+-def acquire_turing_prefill(capacity, num_kv_heads, head_dim, device):
+-    key = (capacity, num_kv_heads, head_dim, device)
++def acquire_turing_prefill(capacity, num_kv_heads, head_dim, device,
++                           num_heads=None, max_queries=2048):
++    key = (capacity, num_kv_heads, head_dim, device, num_heads, max_queries)
+     workspace = _WORKSPACES.get(key)
+     if workspace is None:
+-        workspace = TuringPrefillAttention(capacity, num_kv_heads, head_dim, device)
++        workspace = TuringPrefillAttention(capacity, num_kv_heads, head_dim, device,
++                                           num_heads, max_queries)
+         _WORKSPACES[key] = workspace
+     return workspace
+--- a/v1/attention/ops/turing_prefill_tiles.py
++++ b/v1/attention/ops/turing_prefill_tiles.py
+@@ -62,7 +62,7 @@
+     from torch.utils.cpp_extension import get_default_build_root, load
+     import vllm
+ 
+-    name = "qwen38_turing_prefill_tiles"
++    name = "qwen38_turing_prefill_tiles_stream"
+     build = Path(os.environ.get("TORCH_EXTENSIONS_DIR", get_default_build_root())) / name
+     _prepare_header(build)
+     cutlass = Path(vllm.__file__).parent / "third_party/deep_gemm/include"
+--- a/v1/attention/ops/turing_prefill_tiles.cu
++++ b/v1/attention/ops/turing_prefill_tiles.cu
+@@ -6,6 +6,7 @@
+ #include <c10/cuda/CUDAStream.h>
+ #include <c10/cuda/CUDAException.h>
+ #include <torch/library.h>
++#include <tuple>
+ #include "turing_kernel_forward.h"
+ 
+ namespace qwen38_turing_prefill_tiles {
+@@ -14,15 +15,16 @@
+                                true, 32, 256, 256, false, false>;
+ static_assert(!Kernel::kNeedsOutputAccumulatorBuffer);
+ 
+-at::Tensor attention(const at::Tensor& q, const at::Tensor& k,
+-                     const at::Tensor& v, double scale) {
++std::tuple<at::Tensor, at::Tensor> attention_impl(
++    const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
++    double scale, bool causal, bool with_lse) {
+   TORCH_CHECK(q.is_cuda() && q.dim() == 4 && q.size(3) == 256 &&
+               q.stride(3) == 1, "q: CUDA [B,M,H,256]");
+   TORCH_CHECK(k.dim() == 3 && v.sizes() == k.sizes() &&
+               k.size(0) == q.size(0) && k.size(2) == 256,
+               "kv: [B,N,256]");
+   TORCH_CHECK(q.size(0) > 0 && q.size(2) > 0 &&
+-              q.size(1) > 0 && q.size(1) <= k.size(1),
++              q.size(1) > 0 && k.size(1) > 0 && (!causal || q.size(1) <= k.size(1)),
+               "nonempty causal lower-right shape");
+   for (const auto* t : {&q, &k, &v}) {
+     TORCH_CHECK(t->device() == q.device() && t->scalar_type() == at::kHalf &&
+@@ -36,6 +38,8 @@
+   TORCH_CHECK(sizeof(Kernel::SharedStorage) <= properties.sharedMemPerBlockOptin,
+               "tile shared storage exceeds device capacity");
+   auto out = at::empty(q.sizes(), q.options());
++  auto lse = at::empty({q.size(0), q.size(2), with_lse ? ((q.size(1) + 31) / 32 * 32) : 0},
++                       q.options().dtype(at::kFloat));
+   Kernel::Params p;
+   p.query_ptr = reinterpret_cast<const cutlass::half_t*>(q.data_ptr());
+   p.key_ptr = reinterpret_cast<const cutlass::half_t*>(k.data_ptr());
+@@ -51,7 +55,8 @@
+   p.k_strideB = k.stride(0); p.k_strideM = k.stride(1); p.k_strideH = 0;
+   p.v_strideB = v.stride(0); p.v_strideM = v.stride(1); p.v_strideH = 0;
+   p.o_strideM = out.stride(1);
+-  p.custom_mask_type = Kernel::CausalFromBottomRight;
++  p.custom_mask_type = causal ? Kernel::CausalFromBottomRight : Kernel::NoCustomMask;
++  p.logsumexp_ptr = with_lse ? lse.data_ptr<float>() : nullptr;
+   Kernel::check_supported(p);
+   auto fn = attention_kernel_batched_impl<Kernel>;
+   if (sizeof(Kernel::SharedStorage) > 48 * 1024) {
+@@ -61,13 +66,24 @@
+   fn<<<p.getBlocksGrid(), p.getThreadsGrid(), sizeof(Kernel::SharedStorage),
+        c10::cuda::getCurrentCUDAStream()>>>(p);
+   C10_CUDA_KERNEL_LAUNCH_CHECK();
+-  return out;
++  return {out, lse};
++}
++at::Tensor attention(const at::Tensor& q, const at::Tensor& k,
++                     const at::Tensor& v, double scale) {
++  return std::get<0>(attention_impl(q, k, v, scale, true, false));
++}
++std::tuple<at::Tensor, at::Tensor> attention_lse(
++    const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
++    double scale, bool causal) {
++  return attention_impl(q, k, v, scale, causal, true);
+ }
+ } // namespace qwen38_turing_prefill_tiles
+ 
+ TORCH_LIBRARY(qwen38_turing_prefill_tiles, m) {
+   m.def("attention(Tensor q, Tensor k, Tensor v, float scale) -> Tensor");
++  m.def("attention_lse(Tensor q, Tensor k, Tensor v, float scale, bool causal) -> (Tensor, Tensor)");
+ }
+ TORCH_LIBRARY_IMPL(qwen38_turing_prefill_tiles, CUDA, m) {
+   m.impl("attention", qwen38_turing_prefill_tiles::attention);
++  m.impl("attention_lse", qwen38_turing_prefill_tiles::attention_lse);
+ }
+--- /dev/null
++++ b/v1/attention/ops/turing_prefill_stream.py
+@@ -0,0 +1,120 @@
++"""Bounded-workspace SM75 prefill using FP32 log-sum-exp merging.
++
++KV windows before the query suffix are noncausal. The final window contains
++ALL query tokens and uses lower-right causal masking; never apply a local
++causal mask independently to every KV window.
++"""
++
++import torch
++import triton
++import triton.language as tl
++
++from .turing_prefill_tiles import load_turing_prefill_tiles
++
++
++@triton.jit
++def _merge(
++    part,
++    part_lse,
++    accum,
++    lse,
++    Q: tl.constexpr,
++    H: tl.constexpr,
++    G: tl.constexpr,
++    LSE_Q: tl.constexpr,
++    D: tl.constexpr,
++    FIRST: tl.constexpr,
++):
++    row = tl.program_id(0)
++    token, head = row // H, row % H
++    d = tl.arange(0, D)
++    current = tl.load(part_lse + head * LSE_Q + token)
++    value = tl.load(part + ((head // G * Q + token) * G + head % G) * D + d).to(
++        tl.float32
++    )
++    if FIRST:
++        result, total = value, current
++    else:
++        previous = tl.load(lse + row)
++        maximum = tl.maximum(previous, current)
++        a, b = tl.exp(previous - maximum), tl.exp(current - maximum)
++        total = maximum + tl.log(a + b)
++        result = (tl.load(accum + row * D + d) * a + value * b) / (a + b)
++    tl.store(accum + row * D + d, result)
++    tl.store(lse + row, total)
++
++
++def stream_prefill(workspace, q, k, v, out, table, num_keys, scale, ks, vs):
++    from .turing_prefill_attn import _gather_kv
++
++    qlen, heads, dim = q.shape
++    packed = k.dtype == torch.uint8
++    quant = ks is not None
++    if packed:
++        from .int4_per_token_head import _get_rht_signs
++        from .turing_spec_attn import load_turing_rht
++
++        rht = load_turing_rht()
++        signs = _get_rht_signs(dim, 0, q.device)
++        rht(q, out, signs, False)
++        q = out
++        scale /= dim
++    group = heads // workspace.num_kv_heads
++    grouped_q = q.view(qlen, workspace.num_kv_heads, group, dim).permute(1, 0, 2, 3)
++    load_turing_prefill_tiles()
++    capacity = workspace.key.shape[1]
++    if qlen > capacity:
++        raise ValueError("stream workspace must hold a complete prefill query chunk")
++    accum = workspace.stream_accum[:qlen]
++    lse = workspace.stream_lse[:qlen]
++    start = 0
++    while start < num_keys:
++        remaining = num_keys - start
++        # Do not split the query suffix: earlier windows are wholly visible.
++        size = remaining if remaining <= capacity else min(capacity, remaining - qlen)
++        final = start + size == num_keys
++        _gather_kv[(triton.cdiv(size, 16), workspace.num_kv_heads)](
++            k,
++            v,
++            ks,
++            vs,
++            table,
++            workspace.key,
++            workspace.value,
++            start + size,
++            *k.stride(),
++            *v.stride(),
++            *(ks.stride() if quant else (0, 0, 0)),
++            *(vs.stride() if quant else (0, 0, 0)),
++            start=start,
++            capacity=capacity,
++            D=dim,
++            BLOCK=k.shape[1],
++            QUANT=quant,
++            PACKED=packed,
++            ROWS=16,
++            num_warps=4,
++            num_stages=1,
++        )
++        part, part_lse = torch.ops.qwen38_turing_prefill_tiles.attention_lse(
++            grouped_q, workspace.key[:, :size], workspace.value[:, :size], scale, final
++        )
++        _merge[(qlen * heads,)](
++            part,
++            part_lse,
++            accum,
++            lse,
++            Q=qlen,
++            H=heads,
++            G=group,
++            LSE_Q=part_lse.shape[-1],
++            D=dim,
++            FIRST=start == 0,
++            num_warps=4,
++        )
++        start += size
++    if packed:
++        rht(accum, out, signs, True)
++    else:
++        out.copy_(accum)
++    return out
+--- a/v1/attention/backends/triton_attn.py
++++ b/v1/attention/backends/triton_attn.py
+@@ -831,10 +831,12 @@
+                 vllm_config.model_config.max_model_len + lookahead,
+                 num_kv_heads, head_size,
+                 torch.device("cuda", torch.cuda.current_device()),
++                num_heads=num_heads,
++                max_queries=vllm_config.scheduler_config.max_num_batched_tokens,
+             )
+             logger.info_once(
+                 "Using native SM75 Cutlass prefill (%d MiB shared workspace)",
+-                self._turing_prefill.storage.numel() * 2 // (1024 * 1024),
++                self._turing_prefill.workspace_bytes // (1024 * 1024),
+             )
+ 
+     def forward(
+@@ -1032,7 +1034,7 @@
+             self._turing_prefill.run(
+                 query[:num_actual_tokens], key_cache, value_cache,
+                 output[:num_actual_tokens], block_table, max_seqlen_k, self.scale,
+-                k_scale_cache, v_scale_cache,
++                k_scale_cache, v_scale_cache, cu_seqlens_q, seqused_k,
+             )
+             return output
+ 

@@ -1,7 +1,7 @@
 # Turing (SM75): Qwen3.8-27B on a 22 GB RTX 2080 Ti
 
 This branch adds a Turing port to the 3090 stack. `patches-turing/` is a
-19-patch series applied after `patches/`, on the same vLLM 0.28.0, and it runs the same
+21-patch series applied after `patches/`, on the same vLLM 0.28.0, and it runs the same
 serving setup on a card that is 8 GB smaller and one generation older: an RTX 2080 Ti with 22 GB, running at 280 W (the card's
 factory cap is 250 W).
 
@@ -13,16 +13,22 @@ in this repo are upstream's and are not re-measured here.
 
 ## What SM75 is missing, and what replaces it
 
-| 3090 (SM86) has | Turing (SM75) instead |
+| 3090 (SM86) stack uses | Turing (SM75) instead |
 | --- | --- |
-| fp8 GEMM and fp8 KV | nothing: int4 KV with per-token-head scales and zero points, fp16/fp32 dots (no int4 tensor cores either) |
-| 99 KiB shared memory per SM | 64 KiB, which rules out the fp16 flash-attention tile and the dense Hadamard matrices at head_dim 256 |
-| `m16n8k16` int8/int4 paths, hadacore | fp16 MMA for every dot; a butterfly Hadamard kernel that gathers the rotation into registers instead of shared memory |
-| FA2-style prefill at head_dim 256 | a Cutlass memory-efficient-attention port with 256-key tiles and 64 queries per CTA, fp32 accumulators |
+| fp8 KV storage and bf16 attention | packed int4 KV with per-token-head scales and zero points, fp16 operands / fp32 accumulation |
+| 99 KiB shared memory per SM | 64 KiB, which rules out the larger attention tile and dense Hadamard matrices at head_dim 256 |
+| SM80+-targeted MMA/rotation kernels, hadacore | SM75-specific MMA layouts; a butterfly Hadamard kernel using registers instead of a dense shared-memory matrix |
+| FA2-style prefill at head_dim 256 | a Cutlass memory-efficient-attention port with 256-key tiles and **32 queries per CTA**, fp32 accumulators |
 | `chunk_gated_delta_rule` kernels for SM80+ | an SM75 chunk-state kernel: fp16 MMA operands, fp32 recurrent state in registers |
 
 The port is specific to head_dim 256 and to the packed `int4_per_token_head`
 layout; other shapes fall back to the paths they already had.
+
+**Hardware correction:** Turing does support INT8 and INT4 tensor-core MMA
+([NVIDIA tuning guide](https://docs.nvidia.com/cuda/turing-tuning-guide/index.html#tensor-core-operations)).
+The original attention port does not use it; that is a kernel limitation, not
+missing hardware. The original documentation also said 64 queries per CTA,
+but the shipped Cutlass instantiation uses 32.
 
 ## The series
 
@@ -49,6 +55,8 @@ otherwise produces wrong results or does not run.
 | `spec-attn-scratch-cap` | bounds the 3D-scratch workspace | correctness at large blocks |
 | `sampling-log` | logs effective sampling parameters per request | tooling; explains why greedy-only lookup drafting |
 | `vllm-*` (3) | backports from vLLM after 0.28.0: SSE keep-alive, engine stall sentinel, completion log | operational |
+| `prefill-memory-and-extend` | optional bounded KV staging and a separate small-query split-KV path | [follow-up measurements](turing-prefill.md) |
+| `marlin-prefill-only-int8` | optional transient W4A8 repacking for large-M target GEMMs; canonical decode weights stay intact | lossy prefill mode; [quality and limits](turing-prefill.md) |
 
 ## Running it
 
@@ -82,12 +90,15 @@ Knobs this series adds, all optional:
 | --- | --- | --- |
 | `VLLM_MTP_LOOKUP` | `0` | enable the context-lookup drafts (greedy requests only) |
 | `VLLM_MTP_LOOKUP_MIN` | `24` | shortest tail worth looking up |
-| `VLLM_MTP_LOOKUP_SAMPLED` | `0` | allow the lookup on sampled requests too |
+| `VLLM_MTP_LOOKUP_SAMPLED` | `0` | allow the lookup on sampled requests too; task-dependent (+17% copy, −9.5% free-form prose at 23k), see [turing-prefill.md](turing-prefill.md) |
 | `VLLM_TURING_PREFILL_TILE` | `256` | key-tile width for the prefill kernel; `0` selects the portable fallback |
 | `VLLM_TURING_SPEC_NSEG` | `32` | split-KV partials in the verify attention |
 | `VLLM_TURING_GDN_STATE` | `1` | `0` restores the upstream chunk-state path |
 | `VLLM_SAMPLING_LOG` | `0` | per-request client address, prompt digest and sampling parameters |
 | `VLLM_ENGINE_STALL_SENTINEL_S` | unset | seconds without an engine iteration before it logs and aborts |
+| `VLLM_TURING_PREFILL_WINDOW` | `0` | bounded FP16 staging window; `16384` reduces memory, `0` retains full-context staging |
+| `VLLM_TURING_EXTEND_MAX` | `0` | separate split-KV path up to this query length; `32` is the measured candidate |
+| `VLLM_TURING_PREFILL_INT8` | `off` | `mlp` or `all`: transient W4A8 at M >= 1024, excluding MTP/lm_head; lossy (+0.97% / +1.66% wikitext PPL, +1.81% / +2.84% Python) for −11.7% / −16.0% cold-32k TTFT; [follow-up](turing-prefill.md) |
 
 ## Measurements
 
@@ -122,6 +133,13 @@ with zero preemptions. Attention runs at 32 TFLOPS effective
 there, 60-70% of what fp16 with fp32 accumulation can reach on this part, so the
 tail is close to what this generation of hardware does.
 
+The optional prefill follow-up (`VLLM_TURING_PREFILL_WINDOW`,
+`VLLM_TURING_PREFILL_INT8`) trades perplexity for prefill latency: `mlp` is
+−11.7% cold-32k TTFT for +0.97% wikitext / +1.81% Python perplexity, `all` is
+−16.0% for +1.66% / +2.84%. Both are opt-in; see
+[turing-prefill.md](turing-prefill.md) for the paired quality intervals and
+the longer-context rows.
+
 Quality: 10.8797 perplexity on wikitext-2 test (en 10.8077, da 10.938) and 94.5%
 on GSM8K (n=200), with the int4 KV cache in place. To separate the KV precision
 from the weights, the same server was run with an fp16 KV cache on the same
@@ -146,9 +164,19 @@ Kept here so nobody re-derives them:
 
 ## Known limits
 
+- Where the verify-attention kernel's time goes: compiled variants with one
+  phase removed (131k keys, five queries, nseg 32, one layer) measure the K/V
+  shared-memory staging at ~0.3%, the page-table/scale loads at ~11%, QK MMA at
+  ~10%, PV MMA at ~8%, the softmax/online-rescale phase at ~29%, and ~42% in
+  the score exchange through shared memory, the four barriers per tile and the
+  latency they expose. The kernel is 182 registers and 26 KiB shared: two CTAs
+  per SM, eight warps, ~12% occupancy, so it is latency-bound. Faster staging
+  (cp.async, double buffering) cannot pay because staging is not the cost; a
+  packed-int4 shared stage (4 KiB instead of 17 KiB) that lifts occupancy to
+  3-4 CTAs per SM, and a softmax restructure, are the two open directions.
 - The port assumes head_dim 256 and `int4_per_token_head`. Other shapes take
   the paths they already had, which on SM75 means slower or absent.
-- No fp8 anywhere: no fp8 KV, no fp8 GEMM. `int4_per_token_head` is the only way
+- No native FP8 MMA or validated FP8-KV path in this setup. `int4_per_token_head` is the only validated way
   to reach 262k on this card.
 - Single stream only: these numbers are `max-num-seqs=1`. Serving several
   streams needs a second KV pool, about 5.97 GiB beyond what the card has spare

@@ -1,6 +1,6 @@
 # patches-turing/
 
-The Turing (SM75) series: 19 patches applied after `patches/`, in the order
+The Turing (SM75) series: 21 patches applied after `patches/`, in the order
 listed in `series`. Same vLLM 0.28.0, same install recipe, one generation of
 hardware older: a 22 GB RTX 2080 Ti running the serving setup this repo is built
 for.
@@ -33,4 +33,6 @@ while read -r p; do patch -p1 -d "$SP" < "patches-turing/$p"; done < patches-tur
 ```
 
 `docs/turing-2080ti.md` explains what each patch is for and what the result
-measures, including the parts that were measured and rejected.
+measures, including the parts that were measured and rejected. The two optional
+prefill follow-ups, their quality trade-offs and GPU regression commands are in
+`docs/turing-prefill.md`. Their environment flags default off.

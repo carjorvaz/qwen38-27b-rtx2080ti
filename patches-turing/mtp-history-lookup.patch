@@ -7,10 +7,18 @@ tail with a suffix lookup, and hands the match to the sampler as a whole-block
 draft, with no model calls at all.
 
 Greedy only by default, gated by `VLLM_MTP_LOOKUP` and `VLLM_MTP_LOOKUP_MIN`.
-`VLLM_MTP_LOOKUP_SAMPLED=1` opts sampled traffic in as well: there the lookup's
-point-mass fills lose to probabilistic drafts of the same tokens, so it is off
-until the sampler's temperature handling can be matched. `NMIN`/`NMAX`/`SEARCH`
-bound the search.
+`VLLM_MTP_LOOKUP_SAMPLED=1` opts sampled traffic in as well. The proposal is
+still exact there (a point mass is a legal q for the rejection sampler, with
+acceptance p(x) per position), but it is a *weaker* draft than the drafter's
+own distribution wherever the drafter is right: measured on 23k-token
+documents at temperature 1.0, copy +17% and quote +13% decode, but free-form
+summary -9.5%. `LOOKUP_MIN` cannot exceed `NMAX`; raising both (`NMAX=64`,
+`MIN=48`, `NMIN=8`) buys quote (+27%) and edit (+3.5%) as well and still
+loses ~7% on prose. DFlash2 fuses the two proposals to avoid this, but the
+fusion does not port cleanly: the MTP drafter sees the whole context, so on
+copy work the lookup's value comes precisely from disagreeing with it. Keep
+sampled lookup opt-in, with the NMAX=64 gate for copy-heavy traffic.
+`NMIN`/`NMAX`/`SEARCH` bound the search.
 
 --- a/v1/spec_decode/llm_base_proposer.py
 +++ b/v1/spec_decode/llm_base_proposer.py

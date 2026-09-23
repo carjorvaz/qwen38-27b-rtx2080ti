@@ -2,7 +2,7 @@ A Cutlass tile kernel for prefill attention on SM75.
 
 Turing has no flash-attention kernel for head_dim 256 with the packed int4
 layout, and the per-element fallback leaves most of the SM idle. This ports the
-memory-efficient-attention template to SM75: 256-key tiles, 64 queries per CTA,
+memory-efficient-attention template to SM75: 256-key tiles, 32 queries per CTA,
 fp16 operands with fp32 accumulators, one block per SM. Narrower warp tiles do
 not compile and wider ones spill; both were measured on the 64k and 256k
 shapes, and the shipped constants were the fastest of them.
