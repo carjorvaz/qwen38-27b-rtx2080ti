@@ -1,7 +1,7 @@
 # Turing (SM75): Qwen3.8-27B on a 22 GB RTX 2080 Ti
 
 This branch adds a Turing port to the 3090 stack. `patches-turing/` is a
-21-patch series applied after `patches/`, on the same vLLM 0.28.0, and it runs the same
+22-patch series applied after `patches/`, on the same vLLM 0.28.0, and it runs the same
 serving setup on a card that is 8 GB smaller and one generation older: an RTX 2080 Ti with 22 GB, running at 280 W (the card's
 factory cap is 250 W).
 
@@ -53,6 +53,7 @@ otherwise produces wrong results or does not run.
 | `spec-attn-staging` | vectorized int4 staging in the verify kernel | 64k 42.9 -> 72.6 tok/s, 128k 24.0 -> 49.1 |
 | `int4-attn-fp16-dots` | fp16 dots for the int4 attention | ~2% at 64k, perplexity unchanged |
 | `spec-attn-scratch-cap` | bounds the 3D-scratch workspace | correctness at large blocks |
+| `spec-attn-register-softmax` | scores stay in the QK accumulators; 4-lane reductions and a 512 B (max, sum) exchange replace the 4.6 KiB score tile | layer 1.73 -> 1.22 ms at 131k; decode step 41.2 -> 39.0 / 46.6 -> 44.0 / 57.0 -> 52.9 ms at 32k/64k/128k |
 | `sampling-log` | logs effective sampling parameters per request | tooling; explains why greedy-only lookup drafting |
 | `vllm-*` (3) | backports from vLLM after 0.28.0: SSE keep-alive, engine stall sentinel, completion log | operational |
 | `prefill-memory-and-extend` | optional bounded KV staging and a separate small-query split-KV path | [follow-up measurements](turing-prefill.md) |
@@ -164,23 +165,19 @@ Kept here so nobody re-derives them:
 
 ## Known limits
 
-- Where the verify-attention kernel's time goes: compiled variants with one
-  phase removed (131k keys, five queries, nseg 32, one layer) measure the K/V
-  shared-memory staging at ~0.3%, the page-table/scale loads at ~11%, QK MMA at
-  ~10%, PV MMA at ~8%, the softmax/online-rescale phase at ~29%, and ~42% in
-  the score exchange through shared memory, the four barriers per tile and the
-  latency they expose. The kernel is 182 registers and 26 KiB shared: two CTAs
-  per SM, eight warps, ~12% occupancy, so it is latency-bound. The metadata is
-  not where the win is: pinning the page-table lookup to one cached page
-  measures 1.536 ms against 1.726 ms, but that also makes the K/V staging
-  addresses constant; pinning only the scale addresses, which is the part that
-  could be folded into the staging, measures 1.675 ms (-3%). A register
-  prefetch that issues tile t+1's table and scale loads during tile t recovers
-  1.4%: ptxas reschedules the loads down to their use, so the intent does not
-  survive. Faster staging (cp.async, double buffering) cannot pay because
-  staging is not the cost; a packed-int4 shared stage (4 KiB instead of 17 KiB)
-  that lifts occupancy to 3-4 CTAs per SM, and a softmax restructure, are the
-  two open directions.
+- Where the verify-attention kernel's time went: compiled variants with one
+  phase removed (131k keys, five queries, nseg 32, one layer, baseline
+  1.726 ms) measured K/V staging at ~0.3%, page-table/scale loads at ~11%,
+  QK MMA at ~10%, PV MMA at ~8%, and the score store/reload exchange plus the
+  32-lane softmax at ~45% — `save_score` alone 16%, the softmax loop 29%.
+  `spec-attn-register-softmax` removes the 4.6 KiB score tile and reduces over
+  four lanes instead, taking the layer to 1.223 ms (-29%) and the decode step
+  to 39.0 / 44.0 / 52.9 ms at 32k / 64k / 128k. What is left is latency at low
+  occupancy: 2 CTAs/SM (179 registers, ~22 KiB shared, eight warps, ~12%).
+  Metadata prefetching does not survive ptxas (1.4%), folding the scales into
+  staging is worth 3%, and cp.async cannot pay because staging is not the
+  cost. A packed-int4 shared stage (4 KiB instead of 17 KiB) to reach 3-4 CTAs
+  per SM is the remaining direction.
 - The port assumes head_dim 256 and `int4_per_token_head`. Other shapes take
   the paths they already had, which on SM75 means slower or absent.
 - No native FP8 MMA or validated FP8-KV path in this setup. `int4_per_token_head` is the only validated way

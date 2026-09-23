@@ -1,0 +1,203 @@
+Register-resident softmax for the SM75 verify-attention kernel.
+
+The kernel kept the QK scores in a 4.6 KiB shared tile: each warp wrote its
+16x16 score block, a barrier crossed, and a different warp (rows are owned
+per warp in the softmax loop) reloaded full 32-column rows to reduce over 32
+lanes with five shuffles. Measured, that store/reload exchange plus the
+masking was 45% of the layer (save_score 16%, softmax 29% at 131k keys / five
+queries / 32 segments, one layer).
+
+Here the scores stay in the QK accumulators (four values per lane per row).
+Masking and the per-column K scale are applied in registers, the reduction
+runs over the four lanes that hold a row's half-row (two shuffles, all eight
+row groups at once), and the two warps that split a row exchange one (max,
+sum) pair per row through 512 B of shared. Probabilities are written straight
+to s.probability for the PV step; there is no score buffer.
+
+Reduction order changes, so the output is numerically equivalent, not bitwise
+identical: max |new - old| = 7.6e-6 on the packed fixture, relative RMS 4e-4
+(the baseline is 5.7e-4 against the dense reference), and the dense check
+holds at 5.3e-4 with cosine 1.0.
+
+Measured on 131k keys, five queries, 32 segments, one layer: 1.726 -> 1.223 ms
+(-29%). End to end on the 2080 Ti at 262k/5.5 GiB, same seed and prompts,
+step time 41.2 -> 39.0 ms at 32k, 46.6 -> 44.0 ms at 64k, 57.0 -> 52.9 ms at
+128k (-5.4% / -5.6% / -7.2%), growing with the attention share. Greedy
+acceptance shifts because near-ties flip on the changed rounding.
+
+--- a/v1/attention/ops/turing_spec_attn.cu	2026-09-23 22:40:18
++++ b/v1/attention/ops/turing_spec_attn.cu	2026-09-23 22:40:23
+@@ -54,7 +54,10 @@
+ 
+ struct __align__(16) Shared {
+   __half kv[kKeys][kOperandStride];
+-  float score[kRows][kScoreStride];
++  // Per-tile softmax partials: one (max, sum) pair per column half, row half
++  // and row, exchanged between the two warps that split a row.
++  float part_m[2][2][kRows / 2];
++  float part_l[2][2][kRows / 2];
+   __half probability[kRows][kProbabilityStride];
+   float maximum[kRows];
+   float denominator[kRows];
+@@ -138,22 +141,6 @@
+   return value; // Only lane zero consumes the sum.
+ }
+ 
+-template <bool Quantized>
+-__device__ __forceinline__ void save_score(Shared &s, int row, int column,
+-                                           int tile_position, int kv_len,
+-                                           float value) {
+-  const int position = tile_position + column;
+-  if (s.output_row[row] >= 0 && position < kv_len &&
+-      position <= s.q_position[row]) {
+-    if constexpr (Quantized) {
+-      value *= s.k_scale[column];
+-    }
+-    s.score[row][column] = value;
+-  } else {
+-    // Do not multiply a masked score by a possibly poisoned scale.
+-    s.score[row][column] = -CUDART_INF_F;
+-  }
+-}
+ 
+ 
+ // Vectorized packed-INT4 staging. The per-element path loads one byte per dim
+@@ -353,43 +340,106 @@
+       mma(score0, a0, a1, b0);
+       mma(score1, a0, a1, b1);
+     }
++    // Scores stay in the QK accumulators. Each warp holds 16 of the 32
++    // columns of every row it owns as four values per lane; the reduction is
++    // over the four lanes of a row's group (two shuffles, all row groups at
++    // once) and the two warps that split a row exchange one (max, sum) pair
++    // per row through 512 B of shared. No score tile round trip.
+     const int col0 = qk_column + lane_pair;
+-    save_score<Quantized>(s, row0, col0, tile_position, kv_len, score0.c0);
+-    save_score<Quantized>(s, row0, col0 + 1, tile_position, kv_len, score0.c1);
+-    save_score<Quantized>(s, row1, col0, tile_position, kv_len, score0.c2);
+-    save_score<Quantized>(s, row1, col0 + 1, tile_position, kv_len, score0.c3);
+-    save_score<Quantized>(s, row0, col0 + 8, tile_position, kv_len, score1.c0);
+-    save_score<Quantized>(s, row0, col0 + 9, tile_position, kv_len, score1.c1);
+-    save_score<Quantized>(s, row1, col0 + 8, tile_position, kv_len, score1.c2);
+-    save_score<Quantized>(s, row1, col0 + 9, tile_position, kv_len, score1.c3);
+-    // All QK shared reads finish before K's storage can be reused for V.
+-    __syncthreads();
+-
++    const int half = warp & 1;
++    const int rowh = warp >> 1;
++    const int rl0 = lane_group;
++    const int rl1 = lane_group + 8;
++    const int colidx[4] = {col0, col0 + 1, col0 + 8, col0 + 9};
++    float srow0[4] = {score0.c0, score0.c1, score1.c0, score1.c1};
++    float srow1[4] = {score0.c2, score0.c3, score1.c2, score1.c3};
++    const int64_t qpos0 = s.q_position[row0];
++    const int64_t qpos1 = s.q_position[row1];
++    const bool rowv0 = s.output_row[row0] >= 0;
++    const bool rowv1 = s.output_row[row1] >= 0;
++    bool ok0[4], ok1[4];
+ #pragma unroll
+-    for (int row = warp; row < kRows; row += 4) {
+-      const float score = s.score[row][lane];
+-      const float old_max = s.maximum[row];
+-      const float new_max = fmaxf(old_max, warp_max(score));
+-      const float safe_max = new_max == -CUDART_INF_F ? 0.0f : new_max;
+-      const float alpha =
+-          old_max == -CUDART_INF_F ? 0.0f : __expf(old_max - safe_max);
+-      const float probability = __expf(score - safe_max);
+-      const float tile_sum = warp_sum(probability);
+-      if (lane == 0) {
+-        s.maximum[row] = new_max;
+-        s.denominator[row] = s.denominator[row] * alpha + tile_sum;
+-        s.alpha[row] = alpha;
++    for (int i = 0; i < 4; ++i) {
++      const int64_t pos = tile_position + colidx[i];
++      ok0[i] = rowv0 && pos < kv_len && pos <= qpos0;
++      ok1[i] = rowv1 && pos < kv_len && pos <= qpos1;
++    }
++    if constexpr (Quantized) {
++#pragma unroll
++      for (int i = 0; i < 4; ++i) {
++        const float kscale = s.k_scale[colidx[i]];
++        srow0[i] = ok0[i] ? srow0[i] * kscale : -CUDART_INF_F;
++        srow1[i] = ok1[i] ? srow1[i] * kscale : -CUDART_INF_F;
+       }
+-      float operand = probability;
+-      if constexpr (Quantized) {
+-        const int position = tile_position + lane;
+-        const bool allowed = s.output_row[row] >= 0 && position < kv_len &&
+-                             position <= s.q_position[row];
+-        // Mask before multiplying: zero times a poisoned masked scale is NaN.
+-        operand = allowed ? probability * s.v_scale[lane] : 0.0f;
++    } else {
++#pragma unroll
++      for (int i = 0; i < 4; ++i) {
++        srow0[i] = ok0[i] ? srow0[i] : -CUDART_INF_F;
++        srow1[i] = ok1[i] ? srow1[i] : -CUDART_INF_F;
+       }
+-      s.probability[row][lane] = __float2half_rn(operand);
+     }
++    float m0 = fmaxf(fmaxf(srow0[0], srow0[1]), fmaxf(srow0[2], srow0[3]));
++    float m1 = fmaxf(fmaxf(srow1[0], srow1[1]), fmaxf(srow1[2], srow1[3]));
++#pragma unroll
++    for (int delta = 1; delta <= 2; delta <<= 1) {
++      m0 = fmaxf(m0, __shfl_xor_sync(0xffffffffu, m0, delta));
++      m1 = fmaxf(m1, __shfl_xor_sync(0xffffffffu, m1, delta));
++    }
++    if ((lane & 3) == 0) {
++      s.part_m[half][rowh][rl0] = m0;
++      s.part_m[half][rowh][rl1] = m1;
++    }
++    // Also orders the QK shared reads before the V staging below.
++    __syncthreads();
++    const float gm0 = fmaxf(m0, s.part_m[1 - half][rowh][rl0]);
++    const float gm1 = fmaxf(m1, s.part_m[1 - half][rowh][rl1]);
++    const float old0 = s.maximum[row0];
++    const float old1 = s.maximum[row1];
++    const float safe0 = gm0 == -CUDART_INF_F ? 0.0f : gm0;
++    const float safe1 = gm1 == -CUDART_INF_F ? 0.0f : gm1;
++    const float palpha0 = old0 == -CUDART_INF_F ? 0.0f : __expf(old0 - safe0);
++    const float palpha1 = old1 == -CUDART_INF_F ? 0.0f : __expf(old1 - safe1);
++    float l0 = 0.0f, l1 = 0.0f;
++#pragma unroll
++    for (int i = 0; i < 4; ++i) {
++      srow0[i] = __expf(srow0[i] - safe0);
++      srow1[i] = __expf(srow1[i] - safe1);
++      l0 += srow0[i];
++      l1 += srow1[i];
++    }
++#pragma unroll
++    for (int delta = 1; delta <= 2; delta <<= 1) {
++      l0 += __shfl_xor_sync(0xffffffffu, l0, delta);
++      l1 += __shfl_xor_sync(0xffffffffu, l1, delta);
++    }
++    if ((lane & 3) == 0) {
++      s.part_l[half][rowh][rl0] = l0;
++      s.part_l[half][rowh][rl1] = l1;
++    }
++    __syncthreads();
++    l0 += s.part_l[1 - half][rowh][rl0];
++    l1 += s.part_l[1 - half][rowh][rl1];
++    if (half == 0 && (lane & 3) == 0) {
++      s.maximum[row0] = gm0;
++      s.maximum[row1] = gm1;
++      s.denominator[row0] = s.denominator[row0] * palpha0 + l0;
++      s.denominator[row1] = s.denominator[row1] * palpha1 + l1;
++      s.alpha[row0] = palpha0;
++      s.alpha[row1] = palpha1;
++    }
++    // The V scale is applied to P here; masked lanes stay exactly zero.
++#pragma unroll
++    for (int i = 0; i < 4; ++i) {
++      float p0 = srow0[i];
++      float p1 = srow1[i];
++      if constexpr (Quantized) {
++        const float vscale = s.v_scale[colidx[i]];
++        p0 = ok0[i] ? p0 * vscale : 0.0f;
++        p1 = ok1[i] ? p1 * vscale : 0.0f;
++      }
++      s.probability[row0][colidx[i]] = __float2half_rn(p0);
++      s.probability[row1][colidx[i]] = __float2half_rn(p1);
++    }
+ if constexpr (Packed) {
+       stage_packed_rows(p.v, s, s.v_offset, s.v_zero, tid, warp, lane);
+     } else {

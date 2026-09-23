@@ -1,6 +1,6 @@
 # patches-turing/
 
-The Turing (SM75) series: 21 patches applied after `patches/`, in the order
+The Turing (SM75) series: 22 patches applied after `patches/`, in the order
 listed in `series`. Same vLLM 0.28.0, same install recipe, one generation of
 hardware older: a 22 GB RTX 2080 Ti running the serving setup this repo is built
 for.
