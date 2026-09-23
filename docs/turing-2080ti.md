@@ -170,15 +170,17 @@ Kept here so nobody re-derives them:
   ~10%, PV MMA at ~8%, the softmax/online-rescale phase at ~29%, and ~42% in
   the score exchange through shared memory, the four barriers per tile and the
   latency they expose. The kernel is 182 registers and 26 KiB shared: two CTAs
-  per SM, eight warps, ~12% occupancy, so it is latency-bound. The metadata's
-  own memory traffic is worth ~11% (a variant that pins the page-table lookup
-  to one cached page measures 1.536 ms against 1.726 ms), but a register
-  prefetch that issues tile t+1's table and scale loads during tile t only
-  recovers 1.4%: ptxas reschedules the loads down to their use, so the intent
-  does not survive. Faster staging (cp.async, double buffering) cannot pay
-  because staging is not the cost; a packed-int4 shared stage (4 KiB instead
-  of 17 KiB) that lifts occupancy to 3-4 CTAs per SM, and a softmax
-  restructure, are the two open directions.
+  per SM, eight warps, ~12% occupancy, so it is latency-bound. The metadata is
+  not where the win is: pinning the page-table lookup to one cached page
+  measures 1.536 ms against 1.726 ms, but that also makes the K/V staging
+  addresses constant; pinning only the scale addresses, which is the part that
+  could be folded into the staging, measures 1.675 ms (-3%). A register
+  prefetch that issues tile t+1's table and scale loads during tile t recovers
+  1.4%: ptxas reschedules the loads down to their use, so the intent does not
+  survive. Faster staging (cp.async, double buffering) cannot pay because
+  staging is not the cost; a packed-int4 shared stage (4 KiB instead of 17 KiB)
+  that lifts occupancy to 3-4 CTAs per SM, and a softmax restructure, are the
+  two open directions.
 - The port assumes head_dim 256 and `int4_per_token_head`. Other shapes take
   the paths they already had, which on SM75 means slower or absent.
 - No native FP8 MMA or validated FP8-KV path in this setup. `int4_per_token_head` is the only validated way
