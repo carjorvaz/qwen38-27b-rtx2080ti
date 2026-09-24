@@ -158,6 +158,14 @@ the noise of 200 questions.
 
 Kept here so nobody re-derives them:
 
+- **Native ports of the remaining FLA GDN kernels** (`chunk_scaled_dot_kkt_fwd`,
+  `recompute_w_u_fwd`). Both do their products with `tl.dot`, i.e. SIMT on
+  SM75, but they are latency-bound well above their bandwidth floor (72 KB of
+  traffic per chunk-head for 2.1 MFLOP), so tensor cores do not pay: a fp16
+  WMMA kkt is exact (3.4e-7) and 1.71x (6.73 -> 3.94 ms per layer at T=32768,
+  0.4% end to end), and a 16-warp w_u is 0.90x, i.e. slower than Triton. The
+  same holds for solve_tril and the conv/post kernels: that whole tail is
+  memory- and latency-bound, not compute-bound.
 - **Longer verify blocks** (static k=8, and an adaptive block that asks the
   scheduler for more tokens when a step is fully accepted). k=8 is worth +16 to
   +38% on chat-like traffic, but wide verify at depth costs more than the extra
