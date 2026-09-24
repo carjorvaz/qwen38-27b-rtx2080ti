@@ -183,6 +183,14 @@ Kept here so nobody re-derives them:
   staging is worth 3%, and cp.async cannot pay because staging is not the
   cost. A packed-int4 shared stage (4 KiB instead of 17 KiB) to reach 3-4 CTAs
   per SM is the remaining direction.
+- The GDN chunk-state kernel is native but latency-bound: 5.58 ms per
+  2048-token chunk per layer (1.15 TFLOPS, ~2% of the fp16 peak). Its grid is
+  (N*H, D/VT) = (48, 4) CTAs of four warps with 48 KiB of static shared, so one
+  CTA per SM and about 6% occupancy; each CTA walks its chunks serially with
+  ~5 barriers and six shared round trips per chunk. The state is a
+  scalar-decay linear recurrence per head, so both a shared-memory redesign
+  (operand K-blocking, halved fp32 state tile) and a parallel scan are open.
+  It is 10.6% of the cold-32k prefill.
 - The port assumes head_dim 256 and `int4_per_token_head`. Other shapes take
   the paths they already had, which on SM75 means slower or absent.
 - No native FP8 MMA or validated FP8-KV path in this setup. `int4_per_token_head` is the only validated way
