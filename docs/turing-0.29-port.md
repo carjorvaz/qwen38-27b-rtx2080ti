@@ -60,6 +60,21 @@ for the 3090 series. It also fixes a real break: 0.29 no longer imports `os` in
 No file changed the other way: nothing in the Turing series was dropped for
 being made redundant by 0.29 itself beyond the four retirements above.
 
+## One correctness fix carried in
+
+The port was tested on the 2080 Ti (tiberius) after it applied, and the
+standalone kernel suite found a real bug in the fork's own
+`spec-attn-register-softmax` kernel: its register-softmax update computed the
+new running max from the tile alone, so a tile that is fully masked for a row
+(the partial trailing tile of a segment that already holds valid tiles) set
+that row's running max to `-inf` and rescaled the denominator by `exp(old
+max)`, dropping the segment from the combine. `test_turing_prefill.py` at
+kv_len 2049 / 4097 / 8197 with 16-query blocks reproduces it (relative RMS
+~0.1 against the dense path). The update now carries `max(running, tile)`, as
+the pre-register-softmax kernel did; all 94 comparisons pass, along with the
+GDN and Marlin suites. The same bug is present in any runtime built from the
+series before this fix, including the 0.28.0 one.
+
 ## What is verified
 
 - `patches-turing/check_vllm_series.sh` against a pristine v0.29.0 clone:

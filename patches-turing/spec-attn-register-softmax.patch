@@ -25,8 +25,18 @@ step time 41.2 -> 39.0 ms at 32k, 46.6 -> 44.0 ms at 64k, 57.0 -> 52.9 ms at
 128k (-5.4% / -5.6% / -7.2%), growing with the attention share. Greedy
 acceptance shifts because near-ties flip on the changed rounding.
 
+Correctness fix found on the 2080 Ti while porting to 0.29.0: the first cut
+below computes the new running max from the tile alone, so a tile that is
+fully masked for a row -- the partial trailing tile of a segment that already
+holds valid tiles -- set that row's running max to -inf and rescaled its
+denominator by exp(old max), dropping the segment from the combine.
+test_turing_prefill.py at kv_len 2049 / 4097 / 8197 with 16-query blocks
+reproduced it (relative RMS ~0.1 against the dense path); the update now
+carries max(running, tile), as the shared-score kernel did, and all 94
+comparisons pass.
+
 diff --git a/v1/attention/ops/turing_spec_attn.cu b/v1/attention/ops/turing_spec_attn.cu
-index fe5e9f6..f4442c9 100644
+index fe5e9f6..0bec077 100644
 --- a/v1/attention/ops/turing_spec_attn.cu
 +++ b/v1/attention/ops/turing_spec_attn.cu
 @@ -54,7 +54,10 @@ struct Params {
@@ -64,7 +74,7 @@ index fe5e9f6..f4442c9 100644
  
  
  // Vectorized packed-INT4 staging. The per-element path loads one byte per dim
-@@ -353,42 +340,105 @@ if constexpr (Packed) {
+@@ -353,42 +340,110 @@ if constexpr (Packed) {
        mma(score0, a0, a1, b0);
        mma(score1, a0, a1, b1);
      }
@@ -144,10 +154,15 @@ index fe5e9f6..f4442c9 100644
 +    }
 +    // Also orders the QK shared reads before the V staging below.
 +    __syncthreads();
-+    const float gm0 = fmaxf(m0, s.part_m[1 - half][rowh][rl0]);
-+    const float gm1 = fmaxf(m1, s.part_m[1 - half][rowh][rl1]);
++    const float tile_m0 = fmaxf(m0, s.part_m[1 - half][rowh][rl0]);
++    const float tile_m1 = fmaxf(m1, s.part_m[1 - half][rowh][rl1]);
 +    const float old0 = s.maximum[row0];
 +    const float old1 = s.maximum[row1];
++    // Carry the running max: a tile can be fully masked (its local max is
++    // -inf) while the segment already has valid tiles; replacing the running
++    // max with -inf and rescaling by exp(old) corrupts the partial.
++    const float gm0 = fmaxf(old0, tile_m0);
++    const float gm1 = fmaxf(old1, tile_m1);
 +    const float safe0 = gm0 == -CUDART_INF_F ? 0.0f : gm0;
 +    const float safe1 = gm1 == -CUDART_INF_F ? 0.0f : gm1;
 +    const float palpha0 = old0 == -CUDART_INF_F ? 0.0f : __expf(old0 - safe0);
