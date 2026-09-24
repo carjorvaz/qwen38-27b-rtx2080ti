@@ -1,7 +1,7 @@
 # Turing (SM75): Qwen3.8-27B on a 22 GB RTX 2080 Ti
 
 This branch adds a Turing port to the 3090 stack. `patches-turing/` is a
-22-patch series applied after `patches/`, on the same vLLM 0.28.0, and it runs the same
+23-patch series applied after `patches/`, on the same vLLM 0.28.0, and it runs the same
 serving setup on a card that is 8 GB smaller and one generation older: an RTX 2080 Ti with 22 GB, running at 280 W (the card's
 factory cap is 250 W).
 
@@ -54,6 +54,7 @@ otherwise produces wrong results or does not run.
 | `int4-attn-fp16-dots` | fp16 dots for the int4 attention | ~2% at 64k, perplexity unchanged |
 | `spec-attn-scratch-cap` | bounds the 3D-scratch workspace | correctness at large blocks |
 | `spec-attn-register-softmax` | scores stay in the QK accumulators; 4-lane reductions and a 512 B (max, sum) exchange replace the 4.6 KiB score tile | layer 1.73 -> 1.22 ms at 131k; decode step 41.2 -> 39.0 / 46.6 -> 44.0 / 57.0 -> 52.9 ms at 32k/64k/128k |
+| `gdn-chunk-o` | native fp16 WMMA replacement for FLA's Triton chunk-output kernel, whose `tl.dot` lowers to SIMT on SM75 | 61.3 -> 14.8 ms per layer at T=32k (4.1x); cold 32k 36.3 -> 34.0 s, +32k tail at 48k 50.8 -> 48.6 s, to 128k 145.2 -> 140.8 s |
 | `sampling-log` | logs effective sampling parameters per request | tooling; explains why greedy-only lookup drafting |
 | `vllm-*` (3) | backports from vLLM after 0.28.0: SSE keep-alive, engine stall sentinel, completion log | operational |
 | `prefill-memory-and-extend` | optional bounded KV staging and a separate small-query split-KV path | [follow-up measurements](turing-prefill.md) |
@@ -139,7 +140,11 @@ The optional prefill follow-up (`VLLM_TURING_PREFILL_WINDOW`,
 −11.7% cold-32k TTFT for +0.97% wikitext / +1.81% Python perplexity, `all` is
 −16.0% for +1.66% / +2.84%. Both are opt-in; see
 [turing-prefill.md](turing-prefill.md) for the paired quality intervals and
-the longer-context rows.
+the longer-context rows. Independently of them, `gdn-chunk-o` replaces FLA's
+Triton chunk-output kernel (whose `tl.dot` lowers to SIMT on SM75) with a
+native fp16-WMMA one and takes another **6.3% off cold 32k** (36.3 s ->
+34.0 s), 4.4% off a 32k tail at depth and 3.0% off the run to 128k, without
+touching quality (max |diff| 4.9e-4 against the reference).
 
 Quality: 10.8797 perplexity on wikitext-2 test (en 10.8077, da 10.938) and 94.5%
 on GSM8K (n=200), with the int4 KV cache in place. To separate the KV precision
