@@ -182,6 +182,15 @@ Kept here so nobody re-derives them:
   indexes the block table assuming a full-causal layout.
 - **warpN=32 or 128 in the prefill tile**: the first does not compile, the
   second is 5x slower. Two blocks per SM gained 3% at 64k and nothing at depth.
+- **A hand-written prefill attention built from the verify kernel's parts.**
+  Run as a prefill engine (R requests of 5 queries over a 131k-token context,
+  its own nseg combine) the register-softmax kernel reaches 15.5 / 20.6 /
+  20.6 TFLOPS at 160 / 640 / 1280 queries, while the Cutlass port does 20.8 /
+  29.6 / 31.5 on the same fixture. The simple design saturates where the
+  Cutlass one keeps scaling, so a replacement would need to make up ~1.5x
+  before it won anything; the missing ingredient is software pipelining
+  (double-buffered staging, cp.async, deeper ILP), which is a different class
+  of kernel from anything in this series.
 - **Smaller key tiles in the prefill attention** (`kKeysPerBlock` 128 or 64, to
   trade tile reuse for more resident CTAs): neither compiles. The pinned
   PyTorch template keeps the fp32 output accumulator in registers only while
