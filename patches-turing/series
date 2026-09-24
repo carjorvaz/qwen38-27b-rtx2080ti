@@ -1,6 +1,7 @@
 fp16-attn-verify.patch
 fp16-drafter-units.patch
 gdn-chunk-state.patch
+gdn-state-16w.patch
 mamba-block-retirement.patch
 spec-decode-mma.patch
 mtp-history-lookup.patch

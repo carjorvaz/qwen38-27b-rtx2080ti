@@ -14,7 +14,7 @@ API with key auth, in two ready-made modes.
 
 ## Turing (SM75) support
 
-`patches-turing/` is a 23-patch series applied after `patches/`. It ports the
+`patches-turing/` is a 24-patch series applied after `patches/`. It ports the
 same serving setup to Turing, so an RTX 2080 Ti 22 GB serves 262,144 tokens of
 context out of a 5.5 GiB int4 KV pool, at 112 tok/s single-stream decode at 2k
 and 66 tok/s at 128k. Where the newer stack needs native bf16, a 99 KiB

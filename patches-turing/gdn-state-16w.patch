@@ -1,0 +1,125 @@
+GDN chunk-state kernel at 16 warps instead of 4.
+
+The native SM75 state kernel (gdn-chunk-state.patch) runs 128 threads with a
+48 KiB static shared tile, so one CTA per SM: 4 warps, ~6% occupancy, and the
+per-chunk serial chain of ~5 barriers and six shared round trips dominates.
+Nothing about the tile changes here; the same four tiles per warp become one
+per warp across 16 warps, and the eight projection tiles are computed by the
+first eight warps while the rest proceed to the barrier.
+
+Bitwise identical outputs (h, v_new, final state) against the 4-warp kernel;
+measured 5.67 -> 1.98 ms per 2048-token chunk per layer (3.1x) with one CTA
+per SM and no spills (103 registers at 8 warps, under the 128-register cap
+for 512 threads).
+
+--- a/third_party/flash_linear_attention/ops/turing_gdn.cu
++++ b/third_party/flash_linear_attention/ops/turing_gdn.cu
+@@ -12,7 +12,7 @@
+ 
+ namespace {
+ namespace wmma = nvcuda::wmma;
+-constexpr int BT = 64, D = 128, VT = 32, THREADS = 128;
++constexpr int BT = 64, D = 128, VT = 32, THREADS = 512;
+ constexpr int BS = D + 8, VS = VT + 8, FS = D + 4, PS = VT + 4;
+ using Acc = wmma::fragment<wmma::accumulator, 16, 16, 16, float>;
+ using AR = wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major>;
+@@ -52,7 +52,7 @@
+                              : static_cast<const int32_t *>(p.offsets)[seq];
+   const int chunks = (length + BT - 1) / BT;
+   const int warp = threadIdx.x / 32, tid = threadIdx.x;
+-  Acc state[4];
++  Acc state[1];
+   for (int x = tid; x < VT * D; x += THREADS) {
+     const int v = x / D, k = x % D;
+     const int64_t off = seq * p.ht + head * p.hh + (value_start + v) * p.hv + k;
+@@ -64,9 +64,9 @@
+   }
+   __syncthreads();
+ #pragma unroll
+-  for (int i = 0; i < 4; ++i) {
+-    const int tile = warp + 4 * i, vm = tile / 8, kn = tile % 8;
+-    wmma::load_matrix_sync(state[i], &s.temp.state[vm * 16][kn * 16], FS,
++  {
++    const int tile = warp, vm = tile / 8, kn = tile % 8;
++    wmma::load_matrix_sync(state[0], &s.temp.state[vm * 16][kn * 16], FS,
+                            wmma::mem_row_major);
+   }
+   for (int chunk = 0; chunk < chunks; ++chunk) {
+@@ -74,9 +74,9 @@
+     // Keep FP32 state in registers; publish its FP16 pre-chunk snapshot.
+     __syncthreads();
+ #pragma unroll
+-    for (int i = 0; i < 4; ++i) {
+-      const int tile = warp + 4 * i, vm = tile / 8, kn = tile % 8;
+-      wmma::store_matrix_sync(&s.temp.state[vm * 16][kn * 16], state[i], FS,
++    {
++      const int tile = warp, vm = tile / 8, kn = tile % 8;
++      wmma::store_matrix_sync(&s.temp.state[vm * 16][kn * 16], state[0], FS,
+                               wmma::mem_row_major);
+     }
+     __syncthreads();
+@@ -95,20 +95,20 @@
+                               : __float2half_rn(0.f);
+     }
+     __syncthreads();
+-    Acc projection[2];
+-#pragma unroll
+-    for (int i = 0; i < 2; ++i) {
+-      const int tile = warp + 4 * i, m = tile / 2, n = tile % 2;
+-      wmma::fill_fragment(projection[i], 0.f);
++    // 16 warps, 8 projection tiles: half the warps idle here.
++    if (warp < 8) {
++      const int m = warp / 2, n = warp % 2;
++      Acc projection;
++      wmma::fill_fragment(projection, 0.f);
+ #pragma unroll
+       for (int kk = 0; kk < D; kk += 16) {
+         AR a;
+         BC b;
+         wmma::load_matrix_sync(a, &s.operand[m * 16][kk], BS);
+         wmma::load_matrix_sync(b, &s.state_half[n * 16][kk], BS);
+-        wmma::mma_sync(projection[i], a, b, projection[i]);
++        wmma::mma_sync(projection, a, b, projection);
+       }
+-      wmma::store_matrix_sync(&s.temp.projection[m * 16][n * 16], projection[i],
++      wmma::store_matrix_sync(&s.temp.projection[m * 16][n * 16], projection,
+                               PS, wmma::mem_row_major);
+     }
+     __syncthreads();
+@@ -138,28 +138,28 @@
+     __syncthreads();
+     const float decay = expf(g_last);
+ #pragma unroll
+-    for (int i = 0; i < 4; ++i) {
+-      const int tile = warp + 4 * i, vm = tile / 8, kn = tile % 8;
++    {
++      const int tile = warp, vm = tile / 8, kn = tile % 8;
+ #pragma unroll
+-      for (int j = 0; j < state[i].num_elements; ++j)
+-        state[i].x[j] *= decay;
++      for (int j = 0; j < state[0].num_elements; ++j)
++        state[0].x[j] *= decay;
+ #pragma unroll
+       for (int kk = 0; kk < BT; kk += 16) {
+         AC a;
+         BR b;
+         wmma::load_matrix_sync(a, &s.value[kk][vm * 16], VS);
+         wmma::load_matrix_sync(b, &s.operand[kk][kn * 16], BS);
+-        wmma::mma_sync(state[i], a, b, state[i]);
++        wmma::mma_sync(state[0], a, b, state[0]);
+       }
+     }
+   }
+ #pragma unroll
+-  for (int i = 0; i < 4; ++i) {
+-    const int tile = warp + 4 * i, vm = tile / 8, kn = tile % 8;
++  {
++    const int tile = warp, vm = tile / 8, kn = tile % 8;
+     wmma::store_matrix_sync(
+         p.hf + ((int64_t(seq) * p.H + head) * D + value_start + vm * 16) * D +
+             kn * 16,
+-        state[i], D, wmma::mem_row_major);
++        state[0], D, wmma::mem_row_major);
+   }
+ }
+ 

@@ -1,7 +1,7 @@
 # Turing (SM75): Qwen3.8-27B on a 22 GB RTX 2080 Ti
 
 This branch adds a Turing port to the 3090 stack. `patches-turing/` is a
-23-patch series applied after `patches/`, on the same vLLM 0.28.0, and it runs the same
+24-patch series applied after `patches/`, on the same vLLM 0.28.0, and it runs the same
 serving setup on a card that is 8 GB smaller and one generation older: an RTX 2080 Ti with 22 GB, running at 280 W (the card's
 factory cap is 250 W).
 
@@ -55,6 +55,7 @@ otherwise produces wrong results or does not run.
 | `spec-attn-scratch-cap` | bounds the 3D-scratch workspace | correctness at large blocks |
 | `spec-attn-register-softmax` | scores stay in the QK accumulators; 4-lane reductions and a 512 B (max, sum) exchange replace the 4.6 KiB score tile | layer 1.73 -> 1.22 ms at 131k; decode step 41.2 -> 39.0 / 46.6 -> 44.0 / 57.0 -> 52.9 ms at 32k/64k/128k |
 | `gdn-chunk-o` | native fp16 WMMA replacement for FLA's Triton chunk-output kernel, whose `tl.dot` lowers to SIMT on SM75 | 61.3 -> 14.8 ms per layer at T=32k (4.1x); cold 32k 36.3 -> 34.0 s, +32k tail at 48k 50.8 -> 48.6 s, to 128k 145.2 -> 140.8 s |
+| `gdn-state-16w` | the same state kernel at 16 warps instead of 4, same 48 KiB tile, bitwise identical output | 5.67 -> 1.98 ms per 2048-token chunk per layer (3.1x); cold 32k 34.0 -> 31.9 s, +32k tail at 48k 48.6 -> 46.3 s, to 128k 140.8 -> 135.9 s |
 | `sampling-log` | logs effective sampling parameters per request | tooling; explains why greedy-only lookup drafting |
 | `vllm-*` (3) | backports from vLLM after 0.28.0: SSE keep-alive, engine stall sentinel, completion log | operational |
 | `prefill-memory-and-extend` | optional bounded KV staging and a separate small-query split-KV path | [follow-up measurements](turing-prefill.md) |
@@ -183,14 +184,14 @@ Kept here so nobody re-derives them:
   staging is worth 3%, and cp.async cannot pay because staging is not the
   cost. A packed-int4 shared stage (4 KiB instead of 17 KiB) to reach 3-4 CTAs
   per SM is the remaining direction.
-- The GDN chunk-state kernel is native but latency-bound: 5.58 ms per
-  2048-token chunk per layer (1.15 TFLOPS, ~2% of the fp16 peak). Its grid is
-  (N*H, D/VT) = (48, 4) CTAs of four warps with 48 KiB of static shared, so one
-  CTA per SM and about 6% occupancy; each CTA walks its chunks serially with
-  ~5 barriers and six shared round trips per chunk. The state is a
-  scalar-decay linear recurrence per head, so both a shared-memory redesign
-  (operand K-blocking, halved fp32 state tile) and a parallel scan are open.
-  It is 10.6% of the cold-32k prefill.
+- The GDN chunk-state kernel is native (16 warps since `gdn-state-16w`, 5.67 ->
+  1.98 ms per 2048-token chunk per layer) but still one CTA per SM: its 48 KiB
+  static shared tile leaves 16 warps and 103 registers. It walks its chunks
+  serially with ~5 barriers and six shared round trips per chunk, and the
+  state is a scalar-decay linear recurrence per head, so a shared-memory
+  redesign (operand K-blocking, halved fp32 state tile) for 2 CTAs per SM and
+  a parallel scan are the open directions. It is now ~4% of the cold-32k
+  prefill, down from 10.6%.
 - The port assumes head_dim 256 and `int4_per_token_head`. Other shapes take
   the paths they already had, which on SM75 means slower or absent.
 - No native FP8 MMA or validated FP8-KV path in this setup. `int4_per_token_head` is the only validated way
