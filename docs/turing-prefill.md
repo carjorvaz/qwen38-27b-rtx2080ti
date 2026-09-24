@@ -2,7 +2,10 @@
 
 Optional additions to the [2080 Ti port](turing-2080ti.md), tested on the
 22 GB card at 280 W, vLLM 0.28.0. **All new flags default off.** These are
-separate changes, not a promise that every workload improves.
+separate changes, not a promise that every workload improves. The numbers
+below are 0.28.0 measurements; the tree has since been ported to 0.29.0
+([turing-0.29-port.md](turing-0.29-port.md)) and is pending a re-run on the
+card.
 
 ## What is implemented
 
@@ -234,7 +237,7 @@ one-key prefix window followed by a query-sized causal window), an independent
 FP32 attention reference, noncontiguous outputs with canaries, sign generation
 under a FP16 default dtype, negative weight scales, immutable canonical weights,
 compilation hashes, and dynamic-M CUDA-graph execution. A full GNU-patch pass
-against pristine vLLM 0.28.0 is also required.
+against pristine vLLM 0.29.0 is also required.
 
 ## Investigated but not enabled
 

@@ -5,9 +5,14 @@ replaying that graph would skip the recurrent-state initialization. The runner
 checks the query-length distribution before choosing between the tiled prefill
 kernel and the decode path.
 
+diff --git a/v1/worker/gpu_model_runner.py b/v1/worker/gpu_model_runner.py
+index 22ddbc5..7bb7019 100644
 --- a/v1/worker/gpu_model_runner.py
 +++ b/v1/worker/gpu_model_runner.py
-@@ -3989,20 +3989,24 @@
+@@ -3946,25 +3946,29 @@ class GPUModelRunner(
+             **model_kwargs,
+         )
+ 
 -    @staticmethod
      def _is_uniform_decode(
 +        self,
@@ -43,3 +48,5 @@ kernel and the decode path.
 +                >= self.input_batch.num_prompt_tokens[:num_reqs]
 +            ).all()
          )
+ 
+     def _allow_microbatching(

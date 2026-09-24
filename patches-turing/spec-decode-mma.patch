@@ -6,6 +6,66 @@ accumulation, split-KV partials, and packed int4/int8 KV dequantized inside the
 kernel. Wired into the TRITON_ATTN and FLASH_ATTN paths that the MTP drafter and
 the forward pass use.
 
+diff --git a/v1/attention/backends/flash_attn.py b/v1/attention/backends/flash_attn.py
+index d4486fb..7dabed2 100755
+--- a/v1/attention/backends/flash_attn.py
++++ b/v1/attention/backends/flash_attn.py
+@@ -928,6 +928,9 @@ class FlashAttentionImpl(AttentionImpl):
+             )
+ 
+         self.supports_quant_query_input = flash_attn_supports_quant_query_input()
++        self._spec_attn_max_reqs = (
++            vllm_config.scheduler_config.max_num_seqs if vllm_config is not None else None
++        )
+ 
+         dcp_a2a = (
+             vllm_config is not None
+@@ -1946,23 +1949,20 @@ def _spec_attn_qmax(group: int) -> int:
+ def _spec_attn_run(impl, q, key_cache, value_cache, out, cu_seqlens_q, seqused_k, block_table, max_seqlen_q, k_scale_cache=None, v_scale_cache=None):
+     from vllm.v1.attention.ops.spec_decode_attn import SpecDecodeAttention
+ 
+-    key = (impl.num_heads, impl.head_size, q.device)
++    # The current-config context is absent during graph warmup. Retain the
++    # scheduler's capacity from model construction, not a guessed 256 requests.
++    num_reqs = cu_seqlens_q.shape[0] - 1
++    max_reqs = max(impl._spec_attn_max_reqs or num_reqs, num_reqs)
++    key = (impl.num_heads, impl.head_size, q.device, max_reqs)
+     att = _SPEC_ATTN.get(key)
+     if att is None:
+-        from vllm.config import get_current_vllm_config
+-
+-        try:
+-            max_reqs = get_current_vllm_config().scheduler_config.max_num_seqs
+-        except Exception:
+-            max_reqs = 256
+-        max_reqs = max(max_reqs, cu_seqlens_q.shape[0] - 1)
+         att = SpecDecodeAttention(
+             max_reqs, impl.num_heads, impl.head_size, q.device,
+             qmax=_spec_attn_qmax(impl.num_heads // impl.num_kv_heads),
+         )
+         _SPEC_ATTN[key] = att
+     att.run(q, key_cache, value_cache, out, cu_seqlens_q, seqused_k, block_table, impl.scale,
+-            cu_seqlens_q.shape[0] - 1, max_seqlen_q,
++            num_reqs, max_seqlen_q,
+             k_scale_cache=k_scale_cache, v_scale_cache=v_scale_cache)
+ 
+ 
+diff --git a/v1/attention/backends/triton_attn.py b/v1/attention/backends/triton_attn.py
+index dd3491c..28bf881 100644
+--- a/v1/attention/backends/triton_attn.py
++++ b/v1/attention/backends/triton_attn.py
+@@ -730,6 +730,9 @@ class TritonAttentionImpl(AttentionImpl):
+         # without a current config (unit tests), there is nothing to size from
+         # and the builder allocates, unaccounted, as before.
+         vllm_config = get_current_vllm_config_or_none()
++        self._spec_attn_max_reqs = (
++            vllm_config.scheduler_config.max_num_seqs if vllm_config is not None else None
++        )
+         if vllm_config is not None and current_platform.is_cuda_alike():
+             mq3d_scratch_acquire(
+                 mq3d_scratch_plan(vllm_config, num_heads),
+diff --git a/v1/attention/ops/spec_decode_attn.py b/v1/attention/ops/spec_decode_attn.py
+index cbeb960..506ac5d 100644
 --- a/v1/attention/ops/spec_decode_attn.py
 +++ b/v1/attention/ops/spec_decode_attn.py
 @@ -1,11 +1,11 @@
@@ -22,18 +82,18 @@ the forward pass use.
  computing an online-softmax partial over its slice of the KV cache for all its query
  rows at once (G = query heads per kv head), followed by a tiny combine kernel.
  
-@@ -14,6 +14,10 @@
- made lookup-augmented drafting unaffordable past a block of 7 -- a 16-token verify fell
+@@ -15,6 +15,10 @@ made lookup-augmented drafting unaffordable past a block of 7 -- a 16-token veri
  back to FA2 and doubled the step at 25k context. Each tile re-reads the KV segment, so
  BLOCK_M is chosen to keep the tile count at 1 where the register budget allows.
-+
+ 
 +SM75 with D=256 and FP16 queries uses native Tensor Core partials: Triton's dot
 +lowers to SIMT on this architecture. Register-resident Q fragments leave room for
 +two CTAs per SM, using 32 segments by default. KV scaling and the combine are shared.
- 
++
  Layout matches vLLM's FLASH_ATTN backend: q [T, Hq, D], key/value cache
  [num_blocks, block_size, Hkv, D] (block_size any multiple of 16), block_table
-@@ -170,20 +174,26 @@
+ [num_reqs, max_blocks], seqused_k [num_reqs] = kv length including the new tokens,
+@@ -192,20 +196,26 @@ class SpecDecodeAttention:
      """Holds the partial buffers; call .run(...) per layer."""
  
      def __init__(self, max_num_reqs, num_heads, head_dim, device, qmax,
@@ -66,18 +126,15 @@ the forward pass use.
          n = max_num_reqs * num_heads * qmax * self.nseg
          self.part_o = torch.empty(n, head_dim, dtype=torch.float32, device=device)
          self.part_m = torch.empty(n, dtype=torch.float32, device=device)
-@@ -222,25 +232,37 @@
-         assert num_reqs <= self.max_num_reqs
-         # Turing has 64 KiB shared memory; Ampere's 99 KiB tile does not fit.
-         block_m, qt, ntile, warps = self._plan(max_query_len, G, D)
--        tile = 64 if (block_m <= 32 or D <= 128) else 32
--        if self.small_shared_memory and D == 256:
--            tile = 32
+@@ -268,22 +278,34 @@ class SpecDecodeAttention:
+                       f"num_reqs={num_reqs} qlen={max_query_len} plan block_m={block_m} qt={qt} ntile={ntile} warps={warps} tile={tile} nseg={self.nseg} "
+                       f"seqused={seqused_k[:num_reqs].tolist()}", flush=True)
+                 self._dbg_t0 = _t0
 -        grid = (num_reqs * ntile, Hkv, self.nseg)
 -        _spec_attn_partial[grid](
 -            q, key_cache, value_cache, block_table, seqused_k, cu_seqlens_q,
 -            self.part_o, self.part_m, self.part_l,
--            k_scale_cache, v_scale_cache,
+-            k_scale_cache, v_scale_cache, k_descale, v_descale, q_descale,
 -            scale,
 -            q.stride(0), q.stride(1),
 -            key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),
@@ -86,7 +143,7 @@ the forward pass use.
 -            *(k_scale_cache.stride() if quant else (0, 0, 0)),
 -            *(v_scale_cache.stride() if quant else (0, 0, 0)),
 -            G=G, Hq=Hq, QMAX=self.qmax, D=D, BLOCK_SIZE=key_cache.shape[1], BLOCK_M=block_m,
--            TILE=tile, NSEG=self.nseg, QT=qt, NTILE=ntile, QUANT=quant,
+-            TILE=tile, NSEG=self.nseg, QT=qt, NTILE=ntile, QUANT=quant, FP8=fp8, Q_FP8=q_fp8,
 -            num_warps=warps, num_stages=1,
 -        )
 +        if (
@@ -101,14 +158,11 @@ the forward pass use.
 +                qt, ntile, self.nseg, k_scale_cache, v_scale_cache,
 +            )
 +        else:
-+            tile = 64 if (block_m <= 32 or D <= 128) else 32
-+            if self.small_shared_memory and D == 256:
-+                tile = 32
 +            grid = (num_reqs * ntile, Hkv, self.nseg)
 +            _spec_attn_partial[grid](
 +                q, key_cache, value_cache, block_table, seqused_k, cu_seqlens_q,
 +                self.part_o, self.part_m, self.part_l,
-+                k_scale_cache, v_scale_cache,
++                k_scale_cache, v_scale_cache, k_descale, v_descale, q_descale,
 +                scale,
 +                q.stride(0), q.stride(1),
 +                key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),
@@ -117,40 +171,15 @@ the forward pass use.
 +                *(k_scale_cache.stride() if quant else (0, 0, 0)),
 +                *(v_scale_cache.stride() if quant else (0, 0, 0)),
 +                G=G, Hq=Hq, QMAX=self.qmax, D=D, BLOCK_SIZE=key_cache.shape[1], BLOCK_M=block_m,
-+                TILE=tile, NSEG=self.nseg, QT=qt, NTILE=ntile, QUANT=quant,
++                TILE=tile, NSEG=self.nseg, QT=qt, NTILE=ntile, QUANT=quant, FP8=fp8, Q_FP8=q_fp8,
 +                num_warps=warps, num_stages=1,
 +            )
          _spec_attn_combine[(num_reqs, Hq, max_query_len)](
              self.part_o, self.part_m, self.part_l, out, cu_seqlens_q,
              out.stride(0), out.stride(1),
---- /dev/null
-+++ b/v1/attention/ops/turing_spec_attn.py
-@@ -0,0 +1,25 @@
-+"""SM75 Tensor Core partial attention; load before CUDA graph capture."""
-+
-+from functools import cache
-+from pathlib import Path
-+
-+import torch
-+
-+
-+@cache
-+def load_turing_partial():
-+    from torch.utils.cpp_extension import load
-+
-+    load(
-+        name="qwen38_turing_partial",
-+        sources=[str(Path(__file__).with_suffix(".cu"))],
-+        extra_cflags=["-O3", "-std=c++17"],
-+        extra_cuda_cflags=[
-+            "-O3",
-+            "-std=c++17",
-+            "--expt-relaxed-constexpr",
-+            "-gencode=arch=compute_75,code=sm_75",
-+        ],
-+        is_python_module=False,
-+    )
-+    return torch.ops.qwen38_turing.partial.default
+diff --git a/v1/attention/ops/turing_spec_attn.cu b/v1/attention/ops/turing_spec_attn.cu
+new file mode 100644
+index 0000000..a82479d
 --- /dev/null
 +++ b/v1/attention/ops/turing_spec_attn.cu
 @@ -0,0 +1,552 @@
@@ -706,55 +735,34 @@ the forward pass use.
 +TORCH_LIBRARY_IMPL(qwen38_turing, CUDA, m) {
 +  m.impl("partial", &launch_partial);
 +}
---- a/v1/attention/backends/flash_attn.py
-+++ b/v1/attention/backends/flash_attn.py
-@@ -897,6 +897,9 @@
-         self.supports_quant_query_input = flash_attn_supports_quant_query_input()
- 
-         vllm_config = get_current_vllm_config_or_none()
-+        self._spec_attn_max_reqs = (
-+            vllm_config.scheduler_config.max_num_seqs if vllm_config is not None else None
-+        )
-         dcp_a2a = (
-             vllm_config is not None
-             and vllm_config.parallel_config.decode_context_parallel_size > 1
-@@ -1907,21 +1910,18 @@
- def _spec_attn_run(impl, q, key_cache, value_cache, out, cu_seqlens_q, seqused_k, block_table, max_seqlen_q, k_scale_cache=None, v_scale_cache=None):
-     from vllm.v1.attention.ops.spec_decode_attn import SpecDecodeAttention
- 
--    key = (impl.num_heads, impl.head_size, q.device)
-+    # The current-config context is absent during graph warmup. Retain the
-+    # scheduler's capacity from model construction, not a guessed 256 requests.
-+    num_reqs = cu_seqlens_q.shape[0] - 1
-+    max_reqs = max(impl._spec_attn_max_reqs or num_reqs, num_reqs)
-+    key = (impl.num_heads, impl.head_size, q.device, max_reqs)
-     att = _SPEC_ATTN.get(key)
-     if att is None:
--        from vllm.config import get_current_vllm_config
--
--        try:
--            max_reqs = get_current_vllm_config().scheduler_config.max_num_seqs
--        except Exception:
--            max_reqs = 256
--        max_reqs = max(max_reqs, cu_seqlens_q.shape[0] - 1)
-         att = SpecDecodeAttention(
-             max_reqs, impl.num_heads, impl.head_size, q.device,
-             qmax=_spec_attn_qmax(impl.num_heads // impl.num_kv_heads),
-         )
-         _SPEC_ATTN[key] = att
-     att.run(q, key_cache, value_cache, out, cu_seqlens_q, seqused_k, block_table, impl.scale,
--            cu_seqlens_q.shape[0] - 1, max_seqlen_q,
-+            num_reqs, max_seqlen_q,
-             k_scale_cache=k_scale_cache, v_scale_cache=v_scale_cache)
---- a/v1/attention/backends/triton_attn.py
-+++ b/v1/attention/backends/triton_attn.py
-@@ -787,6 +787,9 @@
-         # without a current config (unit tests), there is nothing to size from
-         # and the builder allocates, unaccounted, as before.
-         vllm_config = get_current_vllm_config_or_none()
-+        self._spec_attn_max_reqs = (
-+            vllm_config.scheduler_config.max_num_seqs if vllm_config is not None else None
-+        )
-         if vllm_config is not None and current_platform.is_cuda_alike():
-             mq3d_scratch_acquire(
-                 mq3d_scratch_plan(vllm_config, num_heads),
+diff --git a/v1/attention/ops/turing_spec_attn.py b/v1/attention/ops/turing_spec_attn.py
+new file mode 100644
+index 0000000..f50c28d
+--- /dev/null
++++ b/v1/attention/ops/turing_spec_attn.py
+@@ -0,0 +1,25 @@
++"""SM75 Tensor Core partial attention; load before CUDA graph capture."""
++
++from functools import cache
++from pathlib import Path
++
++import torch
++
++
++@cache
++def load_turing_partial():
++    from torch.utils.cpp_extension import load
++
++    load(
++        name="qwen38_turing_partial",
++        sources=[str(Path(__file__).with_suffix(".cu"))],
++        extra_cflags=["-O3", "-std=c++17"],
++        extra_cuda_cflags=[
++            "-O3",
++            "-std=c++17",
++            "--expt-relaxed-constexpr",
++            "-gencode=arch=compute_75,code=sm_75",
++        ],
++        is_python_module=False,
++    )
++    return torch.ops.qwen38_turing.partial.default

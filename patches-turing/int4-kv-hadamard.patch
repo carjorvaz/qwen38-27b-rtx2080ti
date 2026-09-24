@@ -5,9 +5,11 @@ is 128 KiB at head_dim 256 and does not fit in Turing's 64 KiB. This gathers the
 same log2(D) in-register stages into one launch, in the same order and in fp32,
 with the working set capped at 32 KiB per program.
 
+diff --git a/v1/attention/ops/int4_per_token_head.py b/v1/attention/ops/int4_per_token_head.py
+index ece955e..d7ed011 100644
 --- a/v1/attention/ops/int4_per_token_head.py
 +++ b/v1/attention/ops/int4_per_token_head.py
-@@ -1084,6 +1084,83 @@
+@@ -1214,6 +1214,83 @@ def _triton_hadamard_transform(x: torch.Tensor) -> torch.Tensor:
      return out2d.reshape(orig_shape).to(orig_dtype)
  
  
@@ -91,7 +93,7 @@ with the working set capped at 32 KiB per program.
  # Public API
  def fast_hadamard_transform(x: torch.Tensor) -> torch.Tensor:
      """Unnormalized Walsh-Hadamard Transform along the last dimension.
-@@ -1093,6 +1170,7 @@
+@@ -1223,6 +1300,7 @@ def fast_hadamard_transform(x: torch.Tensor) -> torch.Tensor:
      Three-tier dispatch:
        1. Hadacore CUDA Tensor Core kernel (sm_80+).
        2. Triton MMA matmul kernel (CUDA fallback + ROCm MFMA/WMMA path).
@@ -99,7 +101,7 @@ with the working set capped at 32 KiB per program.
        3. PyTorch butterfly (CPU and any GPU/dtype combo Triton can't take).
      """
      d = x.shape[-1]
-@@ -1124,6 +1202,17 @@
+@@ -1254,6 +1332,17 @@ def fast_hadamard_transform(x: torch.Tensor) -> torch.Tensor:
      ):
          return _triton_hadamard_transform(x)
  

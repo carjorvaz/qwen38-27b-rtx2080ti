@@ -1,0 +1,224 @@
+Register the Turing series' knobs in envs.py and read them through envs.
+
+vLLM 0.29.0 reads its own fork knobs through `envs` and warns about unknown
+`VLLM_*` variables at boot; it also no longer imports `os` in
+`v1/attention/ops/spec_decode_attn.py`, where VLLM_TURING_SPEC_NSEG was read
+with a raw `os.environ.get` (a NameError on the ported tree). This tail patch
+does for the Turing series what patches/speed-knobs-envs.patch does for the
+3090 series: every VLLM_TURING_* and VLLM_MTP_* knob this series reads is
+declared and registered in `envs.py`, and read through the accessor.
+
+Reads moved: VLLM_TURING_PREFILL_TILE, VLLM_TURING_SPEC_NSEG,
+VLLM_TURING_PREFILL_WINDOW, VLLM_TURING_EXTEND_MAX, VLLM_TURING_GDN_STATE,
+VLLM_TURING_GDN_O, and the VLLM_MTP_LOOKUP family (MIN, SAMPLED, NMIN, NMAX,
+SEARCH). Defaults and semantics are unchanged; the registered knobs now take
+part in the torch.compile cache key, and `VLLM_TURING_SPEC_NSEG=0` means
+"default" the way an unset variable does. Tooling only; no measured change.
+
+diff --git a/envs.py b/envs.py
+index 71ab9ee..1ead469 100755
+--- a/envs.py
++++ b/envs.py
+@@ -194,6 +194,16 @@ if TYPE_CHECKING:
+     VLLM_TURING_PREFILL_INT8: Literal["off", "mlp", "all"] = "off"
+     VLLM_TURING_PREFILL_WINDOW: int = 0
+     VLLM_TURING_EXTEND_MAX: int = 0
++    VLLM_TURING_PREFILL_TILE: int = 256
++    VLLM_TURING_SPEC_NSEG: int = 0
++    VLLM_TURING_GDN_STATE: bool = True
++    VLLM_TURING_GDN_O: bool = True
++    VLLM_MTP_LOOKUP: bool = False
++    VLLM_MTP_LOOKUP_MIN: int = 24
++    VLLM_MTP_LOOKUP_SAMPLED: bool = False
++    VLLM_MTP_LOOKUP_NMIN: int = 4
++    VLLM_MTP_LOOKUP_NMAX: int = 32
++    VLLM_MTP_LOOKUP_SEARCH: int = 1 << 30
+     VLLM_MARLIN_INT8_INCLUDE_RE: str = ""
+     VLLM_MARLIN_INT8_EXCLUDE_RE: str = "lm_head|mtp"
+     VLLM_HUMMING_ONLINE_QUANT_CONFIG: dict[str, Any] | None = None
+@@ -1563,6 +1573,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     ),
+     "VLLM_TURING_PREFILL_WINDOW": lambda: int(os.environ.get("VLLM_TURING_PREFILL_WINDOW", "0")),
+     "VLLM_TURING_EXTEND_MAX": lambda: int(os.environ.get("VLLM_TURING_EXTEND_MAX", "0")),
++    "VLLM_TURING_PREFILL_TILE": lambda: int(os.environ.get("VLLM_TURING_PREFILL_TILE", "256")),
++    "VLLM_TURING_SPEC_NSEG": lambda: int(os.environ.get("VLLM_TURING_SPEC_NSEG", "0")),
++    "VLLM_TURING_GDN_STATE": lambda: os.environ.get("VLLM_TURING_GDN_STATE", "1") == "1",
++    "VLLM_TURING_GDN_O": lambda: os.environ.get("VLLM_TURING_GDN_O", "1") == "1",
++    "VLLM_MTP_LOOKUP": lambda: os.environ.get("VLLM_MTP_LOOKUP", "0") == "1",
++    "VLLM_MTP_LOOKUP_MIN": lambda: int(os.environ.get("VLLM_MTP_LOOKUP_MIN", "24")),
++    "VLLM_MTP_LOOKUP_SAMPLED": lambda: os.environ.get("VLLM_MTP_LOOKUP_SAMPLED", "0") == "1",
++    "VLLM_MTP_LOOKUP_NMIN": lambda: int(os.environ.get("VLLM_MTP_LOOKUP_NMIN", "4")),
++    "VLLM_MTP_LOOKUP_NMAX": lambda: int(os.environ.get("VLLM_MTP_LOOKUP_NMAX", "32")),
++    "VLLM_MTP_LOOKUP_SEARCH": lambda: int(os.environ.get("VLLM_MTP_LOOKUP_SEARCH", str(1 << 30))),
+     "VLLM_MARLIN_INT8_INCLUDE_RE": lambda: os.environ.get(
+         "VLLM_MARLIN_INT8_INCLUDE_RE", ""
+     ),
+diff --git a/third_party/flash_linear_attention/ops/turing_gdn.py b/third_party/flash_linear_attention/ops/turing_gdn.py
+index c5467e1..e11abc1 100644
+--- a/third_party/flash_linear_attention/ops/turing_gdn.py
++++ b/third_party/flash_linear_attention/ops/turing_gdn.py
+@@ -6,11 +6,11 @@ back to the host. VLLM_TURING_GDN_STATE=0 retains the original implementation.
+ """
+ 
+ from functools import cache
+-import os
+ from pathlib import Path
+ 
+ import torch
+ 
++import vllm.envs as envs
+ from .chunk_delta_h import chunk_gated_delta_rule_fwd_h as reference_state
+ from .index import prepare_chunk_indices, prepare_chunk_offsets
+ 
+@@ -54,7 +54,7 @@ def chunk_gated_delta_rule_fwd_h(
+     use_exp2=False,
+ ):
+     supported = (
+-        os.environ.get("VLLM_TURING_GDN_STATE", "1") == "1"
++        envs.VLLM_TURING_GDN_STATE
+         and k.is_cuda
+         and k.dtype == torch.float16
+         and k.ndim == 4
+diff --git a/third_party/flash_linear_attention/ops/turing_gdn_o.py b/third_party/flash_linear_attention/ops/turing_gdn_o.py
+index ce5ee56..59a27b4 100644
+--- a/third_party/flash_linear_attention/ops/turing_gdn_o.py
++++ b/third_party/flash_linear_attention/ops/turing_gdn_o.py
+@@ -10,11 +10,11 @@ it.
+ """
+ 
+ from functools import cache
+-import os
+ from pathlib import Path
+ 
+ import torch
+ 
++import vllm.envs as envs
+ from .chunk_o import chunk_fwd_o as reference_o
+ from .index import prepare_chunk_indices
+ 
+@@ -55,7 +55,7 @@ def chunk_fwd_o(
+     core_attn_out: torch.Tensor | None = None,
+ ) -> torch.Tensor:
+     supported = (
+-        os.environ.get("VLLM_TURING_GDN_O", "1") == "1"
++        envs.VLLM_TURING_GDN_O
+         and q.is_cuda
+         and q.dtype == torch.float16
+         and q.ndim == 4
+diff --git a/v1/attention/ops/spec_decode_attn.py b/v1/attention/ops/spec_decode_attn.py
+index c982a72..029c0dd 100644
+--- a/v1/attention/ops/spec_decode_attn.py
++++ b/v1/attention/ops/spec_decode_attn.py
+@@ -227,9 +227,9 @@ class SpecDecodeAttention:
+             # is an experiment override. The Triton kernels take NSEG as a
+             # constexpr, so each value compiles its own kernel (no stale
+             # graphs when swapping values between boots).
+-            _override = os.environ.get("VLLM_TURING_SPEC_NSEG")
++            _override = envs.VLLM_TURING_SPEC_NSEG
+             if _override:
+-                num_segments = int(_override)
++                num_segments = _override
+             else:
+                 num_segments = (
+                     32 if self.turing_partial is not None else NUM_SEGMENTS
+diff --git a/v1/attention/ops/turing_prefill_attn.py b/v1/attention/ops/turing_prefill_attn.py
+index 2e3b5d6..6b007da 100644
+--- a/v1/attention/ops/turing_prefill_attn.py
++++ b/v1/attention/ops/turing_prefill_attn.py
+@@ -5,13 +5,13 @@ for 816 queries over 65K INT8 keys). A shared, pre-profiled FP16 workspace
+ avoids both those spills and an unbounded per-layer dequantization allocation.
+ Decode and multi-request batches retain their existing paged kernels.
+ """
+-import os
+-
+ import torch
+ import triton
+ import triton.language as tl
+ from torch.nn.attention import SDPBackend, sdpa_kernel
+ from torch.nn.attention.bias import causal_lower_right
++
++import vllm.envs as envs
+ from .turing_prefill_tiles import scaled_dot_product_attention
+ 
+ 
+@@ -98,8 +98,8 @@ class TuringPrefillAttention:
+         self.capacity = capacity
+         self.num_kv_heads = num_kv_heads
+         self.head_dim = head_dim
+-        self.stream_tokens = int(os.environ.get("VLLM_TURING_PREFILL_WINDOW", "0"))
+-        if self.stream_tokens and os.environ.get("VLLM_TURING_PREFILL_TILE", "256") != "256":
++        self.stream_tokens = envs.VLLM_TURING_PREFILL_WINDOW
++        if self.stream_tokens and envs.VLLM_TURING_PREFILL_TILE != 256:
+             raise ValueError("windowed prefill requires VLLM_TURING_PREFILL_TILE=256")
+         if self.stream_tokens and (
+             self.stream_tokens < max_queries or self.stream_tokens % 256 or num_heads is None
+@@ -115,7 +115,7 @@ class TuringPrefillAttention:
+             self.stream_accum = torch.empty((max_queries, num_heads, head_dim), dtype=torch.float32, device=device)
+             self.stream_lse = torch.empty((max_queries, num_heads), dtype=torch.float32, device=device)
+         self.extend = None
+-        extend_max = int(os.environ.get("VLLM_TURING_EXTEND_MAX", "0"))
++        extend_max = envs.VLLM_TURING_EXTEND_MAX
+         if not 0 <= extend_max <= 64:
+             raise ValueError("VLLM_TURING_EXTEND_MAX must be between 0 and 64")
+         if (extend_max and num_heads is not None and head_dim == 256
+diff --git a/v1/attention/ops/turing_prefill_tiles.py b/v1/attention/ops/turing_prefill_tiles.py
+index cfb6f17..6e51fb1 100644
+--- a/v1/attention/ops/turing_prefill_tiles.py
++++ b/v1/attention/ops/turing_prefill_tiles.py
+@@ -14,6 +14,8 @@ import torch
+ from torch.nn.attention.bias import CausalBias, CausalVariant
+ from torch.nn.functional import scaled_dot_product_attention as reference_attention
+ 
++import vllm.envs as envs
++
+ 
+ @cache
+ def _is_sm75(device):
+@@ -83,7 +85,7 @@ def load_turing_prefill_tiles():
+ 
+ def scaled_dot_product_attention(q, k, v, *, attn_mask, scale):
+     supported = (
+-        os.environ.get("VLLM_TURING_PREFILL_TILE", "256") == "256"
++        envs.VLLM_TURING_PREFILL_TILE == 256
+         and q.is_cuda
+         and q.dtype == k.dtype == v.dtype == torch.float16
+         and q.ndim == k.ndim == v.ndim == 4
+diff --git a/v1/spec_decode/llm_base_proposer.py b/v1/spec_decode/llm_base_proposer.py
+index f8097d4..7833762 100644
+--- a/v1/spec_decode/llm_base_proposer.py
++++ b/v1/spec_decode/llm_base_proposer.py
+@@ -1,7 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import dataclasses
+-import os
+ from importlib.util import find_spec
+ from typing import TYPE_CHECKING, Any, cast
+ 
+@@ -114,20 +113,16 @@ class SpecDecodeBaseProposer:
+         # Turing port: the model runner is needed for the request token history
+         # of the MTP history lookup (VLLM_MTP_LOOKUP).
+         self.runner = runner
+-        self._lookup_enabled = os.environ.get("VLLM_MTP_LOOKUP", "0") == "1"
+-        self._lookup_min = int(os.environ.get("VLLM_MTP_LOOKUP_MIN", "24"))
++        self._lookup_enabled = envs.VLLM_MTP_LOOKUP
++        self._lookup_min = envs.VLLM_MTP_LOOKUP_MIN
+         # Sampled requests are served too: the proposal carries no draft
+         # distribution, which the rejection sampler treats as a one-hot draft
+         # (draft_sample_method="greedy" semantics) -- exact, with acceptance
+         # p(x) per position instead of 1.
+-        self._lookup_sample = (
+-            os.environ.get("VLLM_MTP_LOOKUP_SAMPLED", "0") == "1"
+-        )
+-        self._lookup_nmin = int(os.environ.get("VLLM_MTP_LOOKUP_NMIN", "4"))
+-        self._lookup_nmax = int(os.environ.get("VLLM_MTP_LOOKUP_NMAX", "32"))
+-        self._lookup_search = int(
+-            os.environ.get("VLLM_MTP_LOOKUP_SEARCH", str(1 << 30))
+-        )
++        self._lookup_sample = envs.VLLM_MTP_LOOKUP_SAMPLED
++        self._lookup_nmin = envs.VLLM_MTP_LOOKUP_NMIN
++        self._lookup_nmax = envs.VLLM_MTP_LOOKUP_NMAX
++        self._lookup_search = envs.VLLM_MTP_LOOKUP_SEARCH
+         self._lookup_state = None
+         self._lookup_hits = 0
+         self._lookup_steps = 0

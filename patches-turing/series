@@ -1,8 +1,19 @@
+# Apply order for the Turing patches, one basename per line. They are applied
+# after upstream's patches/series, on the same pristine vLLM 0.29.0 tree, with
+# GNU patch at --fuzz 0 (patches-turing/check_vllm_series.sh enforces both).
+# Comments and blank lines are ignored; the directory and this list must agree.
+#
+# Four 0.28-era patches are retired at the 0.29 port because upstream's series
+# now carries them (see patches-turing/README.md):
+#   mamba-block-retirement.patch      -> patches/mamba-align-retire-null-gaps.patch
+#   vllm-engine-completion-log.patch  -> patches/engine-completion-log.patch
+#   vllm-engine-stall-sentinel.patch  -> patches/engine-stall-sentinel.patch
+#   vllm-sse-keep-alive.patch         -> native in vLLM 0.29.0
+
 fp16-attn-verify.patch
 fp16-drafter-units.patch
 gdn-chunk-state.patch
 gdn-state-16w.patch
-mamba-block-retirement.patch
 spec-decode-mma.patch
 mtp-history-lookup.patch
 mtp-prefix-checkpoint.patch
@@ -15,10 +26,8 @@ spec-attn-staging.patch
 int4-attn-fp16-dots.patch
 spec-attn-scratch-cap.patch
 sampling-log.patch
-vllm-engine-completion-log.patch
-vllm-engine-stall-sentinel.patch
-vllm-sse-keep-alive.patch
 prefill-memory-and-extend.patch
 marlin-prefill-only-int8.patch
 spec-attn-register-softmax.patch
 gdn-chunk-o.patch
+envs-knobs.patch

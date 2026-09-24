@@ -25,9 +25,11 @@ step time 41.2 -> 39.0 ms at 32k, 46.6 -> 44.0 ms at 64k, 57.0 -> 52.9 ms at
 128k (-5.4% / -5.6% / -7.2%), growing with the attention share. Greedy
 acceptance shifts because near-ties flip on the changed rounding.
 
---- a/v1/attention/ops/turing_spec_attn.cu	2026-09-23 22:40:18
-+++ b/v1/attention/ops/turing_spec_attn.cu	2026-09-23 22:40:23
-@@ -54,7 +54,10 @@
+diff --git a/v1/attention/ops/turing_spec_attn.cu b/v1/attention/ops/turing_spec_attn.cu
+index fe5e9f6..f4442c9 100644
+--- a/v1/attention/ops/turing_spec_attn.cu
++++ b/v1/attention/ops/turing_spec_attn.cu
+@@ -54,7 +54,10 @@ struct Params {
  
  struct __align__(16) Shared {
    __half kv[kKeys][kOperandStride];
@@ -39,7 +41,7 @@ acceptance shifts because near-ties flip on the changed rounding.
    __half probability[kRows][kProbabilityStride];
    float maximum[kRows];
    float denominator[kRows];
-@@ -138,22 +141,6 @@
+@@ -138,22 +141,6 @@ __device__ __forceinline__ float warp_sum(float value) {
    return value; // Only lane zero consumes the sum.
  }
  
@@ -62,7 +64,7 @@ acceptance shifts because near-ties flip on the changed rounding.
  
  
  // Vectorized packed-INT4 staging. The per-element path loads one byte per dim
-@@ -353,43 +340,106 @@
+@@ -353,42 +340,105 @@ if constexpr (Packed) {
        mma(score0, a0, a1, b0);
        mma(score1, a0, a1, b1);
      }
@@ -95,6 +97,20 @@ acceptance shifts because near-ties flip on the changed rounding.
 +    const bool rowv0 = s.output_row[row0] >= 0;
 +    const bool rowv1 = s.output_row[row1] >= 0;
 +    bool ok0[4], ok1[4];
++#pragma unroll
++    for (int i = 0; i < 4; ++i) {
++      const int64_t pos = tile_position + colidx[i];
++      ok0[i] = rowv0 && pos < kv_len && pos <= qpos0;
++      ok1[i] = rowv1 && pos < kv_len && pos <= qpos1;
++    }
++    if constexpr (Quantized) {
++#pragma unroll
++      for (int i = 0; i < 4; ++i) {
++        const float kscale = s.k_scale[colidx[i]];
++        srow0[i] = ok0[i] ? srow0[i] * kscale : -CUDART_INF_F;
++        srow1[i] = ok1[i] ? srow1[i] * kscale : -CUDART_INF_F;
++      }
++    } else {
  #pragma unroll
 -    for (int row = warp; row < kRows; row += 4) {
 -      const float score = s.score[row][lane];
@@ -109,33 +125,12 @@ acceptance shifts because near-ties flip on the changed rounding.
 -        s.maximum[row] = new_max;
 -        s.denominator[row] = s.denominator[row] * alpha + tile_sum;
 -        s.alpha[row] = alpha;
-+    for (int i = 0; i < 4; ++i) {
-+      const int64_t pos = tile_position + colidx[i];
-+      ok0[i] = rowv0 && pos < kv_len && pos <= qpos0;
-+      ok1[i] = rowv1 && pos < kv_len && pos <= qpos1;
-+    }
-+    if constexpr (Quantized) {
-+#pragma unroll
-+      for (int i = 0; i < 4; ++i) {
-+        const float kscale = s.k_scale[colidx[i]];
-+        srow0[i] = ok0[i] ? srow0[i] * kscale : -CUDART_INF_F;
-+        srow1[i] = ok1[i] ? srow1[i] * kscale : -CUDART_INF_F;
-       }
--      float operand = probability;
--      if constexpr (Quantized) {
--        const int position = tile_position + lane;
--        const bool allowed = s.output_row[row] >= 0 && position < kv_len &&
--                             position <= s.q_position[row];
--        // Mask before multiplying: zero times a poisoned masked scale is NaN.
--        operand = allowed ? probability * s.v_scale[lane] : 0.0f;
-+    } else {
-+#pragma unroll
 +      for (int i = 0; i < 4; ++i) {
 +        srow0[i] = ok0[i] ? srow0[i] : -CUDART_INF_F;
 +        srow1[i] = ok1[i] ? srow1[i] : -CUDART_INF_F;
        }
--      s.probability[row][lane] = __float2half_rn(operand);
-     }
+-      float operand = probability;
++    }
 +    float m0 = fmaxf(fmaxf(srow0[0], srow0[1]), fmaxf(srow0[2], srow0[3]));
 +    float m1 = fmaxf(fmaxf(srow1[0], srow1[1]), fmaxf(srow1[2], srow1[3]));
 +#pragma unroll
@@ -190,14 +185,19 @@ acceptance shifts because near-ties flip on the changed rounding.
 +    for (int i = 0; i < 4; ++i) {
 +      float p0 = srow0[i];
 +      float p1 = srow1[i];
-+      if constexpr (Quantized) {
+       if constexpr (Quantized) {
+-        const int position = tile_position + lane;
+-        const bool allowed = s.output_row[row] >= 0 && position < kv_len &&
+-                             position <= s.q_position[row];
+-        // Mask before multiplying: zero times a poisoned masked scale is NaN.
+-        operand = allowed ? probability * s.v_scale[lane] : 0.0f;
 +        const float vscale = s.v_scale[colidx[i]];
 +        p0 = ok0[i] ? p0 * vscale : 0.0f;
 +        p1 = ok1[i] ? p1 * vscale : 0.0f;
-+      }
+       }
+-      s.probability[row][lane] = __float2half_rn(operand);
 +      s.probability[row0][colidx[i]] = __float2half_rn(p0);
 +      s.probability[row1][colidx[i]] = __float2half_rn(p1);
-+    }
+     }
  if constexpr (Packed) {
        stage_packed_rows(p.v, s, s.v_offset, s.v_zero, tid, warp, lane);
-     } else {

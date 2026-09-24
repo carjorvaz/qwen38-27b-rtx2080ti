@@ -14,9 +14,12 @@ limit reject the multi-query 3D path (now boots and measures at parity with
 the native path) and what any longer verify block would otherwise hit.
 
 --- generated hunks below ---
+
+diff --git a/v1/attention/ops/int4_per_token_head.py b/v1/attention/ops/int4_per_token_head.py
+index d7ed011..79d300e 100644
 --- a/v1/attention/ops/int4_per_token_head.py
 +++ b/v1/attention/ops/int4_per_token_head.py
-@@ -550,12 +550,18 @@
+@@ -550,12 +550,18 @@ def _attn_packed(
          )
          # Dequantize KV.  INT4 unpacks nibbles as plain uint [0..15];
          # the zero-point is applied on the score side.
@@ -39,7 +42,7 @@ the native path) and what any longer verify block would otherwise hit.
  
          ks_idx = (
              physical_block_idx * stride_ks_blk
-@@ -632,8 +638,11 @@
+@@ -632,8 +638,11 @@ def _attn_packed(
  
          # Fuse v per-(token, head) scale into P.  INT4 also subtracts
          # the v-zero-point contribution from each stream once.

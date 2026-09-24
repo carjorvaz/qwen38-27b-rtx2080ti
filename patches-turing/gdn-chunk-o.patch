@@ -15,6 +15,8 @@ by the test harness; the reference remains the fallback for every other
 geometry. The pre-chunk state h is read in its real layout, a contiguous
 [1, chunks, H, V, K] tensor.
 
+diff --git a/third_party/flash_linear_attention/ops/chunk.py b/third_party/flash_linear_attention/ops/chunk.py
+index e07df08..3e42363 100644
 --- a/third_party/flash_linear_attention/ops/chunk.py
 +++ b/third_party/flash_linear_attention/ops/chunk.py
 @@ -11,7 +11,7 @@
@@ -26,127 +28,9 @@ geometry. The pre-chunk state h is read in its real layout, a contiguous
  from .chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
  from .cumsum import chunk_local_cumsum
  from .l2norm import l2norm_fwd
---- /dev/null
-+++ b/third_party/flash_linear_attention/ops/turing_gdn_o.py
-@@ -0,0 +1,118 @@
-+"""SM75 native GDN chunk output (chunk_fwd_o) with FP16 WMMA.
-+
-+The FLA Triton kernel's ``tl.dot`` lowers to SIMT on SM75, where the chunk
-+output kernel measures ~1.45 TFLOPS; this native kernel runs the same three
-+products (q k^T, q h^T, A v) on tensor cores with fp32 accumulation. It
-+handles the varlen/chunk-indexed layout the serving path uses, a partial last
-+chunk, and an optional preallocated output buffer. ``VLLM_TURING_GDN_O=0``
-+keeps the original implementation, and any unsupported geometry falls back to
-+it.
-+"""
-+
-+from functools import cache
-+import os
-+from pathlib import Path
-+
-+import torch
-+
-+from .chunk_o import chunk_fwd_o as reference_o
-+from .index import prepare_chunk_indices
-+
-+
-+@cache
-+def _is_sm75(device):
-+    return torch.cuda.get_device_capability(device) == (7, 5)
-+
-+
-+@cache
-+def load_turing_gdn_o():
-+    from torch.utils.cpp_extension import load
-+
-+    load(
-+        name="qwen38_turing_gdn_o",
-+        sources=[str(Path(__file__).with_suffix(".cu"))],
-+        extra_cflags=["-O3", "-std=c++17"],
-+        extra_cuda_cflags=[
-+            "-O3",
-+            "-std=c++17",
-+            "-gencode=arch=compute_75,code=sm_75",
-+        ],
-+        is_python_module=False,
-+    )
-+    return torch.ops.qwen38_turing_gdn_o.o.default
-+
-+
-+def chunk_fwd_o(
-+    q: torch.Tensor,
-+    k: torch.Tensor,
-+    v: torch.Tensor,
-+    h: torch.Tensor,
-+    g: torch.Tensor | None = None,  # cumsum of log decay
-+    scale: float | None = None,
-+    cu_seqlens: torch.Tensor | None = None,
-+    chunk_indices: torch.Tensor | None = None,
-+    chunk_size: int = 64,
-+    core_attn_out: torch.Tensor | None = None,
-+) -> torch.Tensor:
-+    supported = (
-+        os.environ.get("VLLM_TURING_GDN_O", "1") == "1"
-+        and q.is_cuda
-+        and q.dtype == torch.float16
-+        and q.ndim == 4
-+        and q.shape[0] == 1
-+        and q.shape[1] > 0
-+        and q.shape[-1] == 128
-+        and k.shape == q.shape
-+        and k.dtype == q.dtype
-+        and v.dtype == torch.float16
-+        and v.ndim == 4
-+        and v.shape[:2] == q.shape[:2]
-+        and v.shape[-1] == 128
-+        and v.shape[2] > 0
-+        and v.shape[2] % q.shape[2] == 0
-+        and h.dtype == torch.float16
-+        and h.is_contiguous()
-+        and g is not None
-+        and g.dtype == torch.float32
-+        and g.shape == v.shape[:3]
-+        and cu_seqlens is not None
-+        and cu_seqlens.dtype == torch.int32
-+        and cu_seqlens.is_contiguous()
-+        and cu_seqlens.numel() >= 2
-+        and chunk_size == 64
-+        and (
-+            core_attn_out is None
-+            or (
-+                core_attn_out.is_cuda
-+                and core_attn_out.dtype == torch.float16
-+                and core_attn_out.is_contiguous()
-+                and core_attn_out.numel() >= v.numel()
-+            )
-+        )
-+        and all(
-+            x.device == q.device and x.stride(-1) == 1 for x in (q, k, v, h)
-+        )
-+        and g.device == q.device
-+        and cu_seqlens.device == q.device
-+        and _is_sm75(q.device)
-+    )
-+    if not supported:
-+        return reference_o(
-+            q=q,
-+            k=k,
-+            v=v,
-+            h=h,
-+            g=g,
-+            scale=scale,
-+            cu_seqlens=cu_seqlens,
-+            chunk_indices=chunk_indices,
-+            chunk_size=chunk_size,
-+            core_attn_out=core_attn_out,
-+        )
-+    if chunk_indices is None:
-+        chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
-+    if scale is None:
-+        scale = q.shape[-1] ** -0.5
-+    return load_turing_gdn_o()(
-+        core_attn_out, q, k, v, h, g, cu_seqlens, chunk_indices, float(scale)
-+    )
+diff --git a/third_party/flash_linear_attention/ops/turing_gdn_o.cu b/third_party/flash_linear_attention/ops/turing_gdn_o.cu
+new file mode 100644
+index 0000000..084b220
 --- /dev/null
 +++ b/third_party/flash_linear_attention/ops/turing_gdn_o.cu
 @@ -0,0 +1,269 @@
@@ -419,3 +303,127 @@ geometry. The pre-chunk state h is read in its real layout, a contiguous
 +        "Tensor chunk_indices, float scale) -> Tensor");
 +}
 +TORCH_LIBRARY_IMPL(qwen38_turing_gdn_o, CUDA, m) { m.impl("o", o); }
+diff --git a/third_party/flash_linear_attention/ops/turing_gdn_o.py b/third_party/flash_linear_attention/ops/turing_gdn_o.py
+new file mode 100644
+index 0000000..ce5ee56
+--- /dev/null
++++ b/third_party/flash_linear_attention/ops/turing_gdn_o.py
+@@ -0,0 +1,118 @@
++"""SM75 native GDN chunk output (chunk_fwd_o) with FP16 WMMA.
++
++The FLA Triton kernel's ``tl.dot`` lowers to SIMT on SM75, where the chunk
++output kernel measures ~1.45 TFLOPS; this native kernel runs the same three
++products (q k^T, q h^T, A v) on tensor cores with fp32 accumulation. It
++handles the varlen/chunk-indexed layout the serving path uses, a partial last
++chunk, and an optional preallocated output buffer. ``VLLM_TURING_GDN_O=0``
++keeps the original implementation, and any unsupported geometry falls back to
++it.
++"""
++
++from functools import cache
++import os
++from pathlib import Path
++
++import torch
++
++from .chunk_o import chunk_fwd_o as reference_o
++from .index import prepare_chunk_indices
++
++
++@cache
++def _is_sm75(device):
++    return torch.cuda.get_device_capability(device) == (7, 5)
++
++
++@cache
++def load_turing_gdn_o():
++    from torch.utils.cpp_extension import load
++
++    load(
++        name="qwen38_turing_gdn_o",
++        sources=[str(Path(__file__).with_suffix(".cu"))],
++        extra_cflags=["-O3", "-std=c++17"],
++        extra_cuda_cflags=[
++            "-O3",
++            "-std=c++17",
++            "-gencode=arch=compute_75,code=sm_75",
++        ],
++        is_python_module=False,
++    )
++    return torch.ops.qwen38_turing_gdn_o.o.default
++
++
++def chunk_fwd_o(
++    q: torch.Tensor,
++    k: torch.Tensor,
++    v: torch.Tensor,
++    h: torch.Tensor,
++    g: torch.Tensor | None = None,  # cumsum of log decay
++    scale: float | None = None,
++    cu_seqlens: torch.Tensor | None = None,
++    chunk_indices: torch.Tensor | None = None,
++    chunk_size: int = 64,
++    core_attn_out: torch.Tensor | None = None,
++) -> torch.Tensor:
++    supported = (
++        os.environ.get("VLLM_TURING_GDN_O", "1") == "1"
++        and q.is_cuda
++        and q.dtype == torch.float16
++        and q.ndim == 4
++        and q.shape[0] == 1
++        and q.shape[1] > 0
++        and q.shape[-1] == 128
++        and k.shape == q.shape
++        and k.dtype == q.dtype
++        and v.dtype == torch.float16
++        and v.ndim == 4
++        and v.shape[:2] == q.shape[:2]
++        and v.shape[-1] == 128
++        and v.shape[2] > 0
++        and v.shape[2] % q.shape[2] == 0
++        and h.dtype == torch.float16
++        and h.is_contiguous()
++        and g is not None
++        and g.dtype == torch.float32
++        and g.shape == v.shape[:3]
++        and cu_seqlens is not None
++        and cu_seqlens.dtype == torch.int32
++        and cu_seqlens.is_contiguous()
++        and cu_seqlens.numel() >= 2
++        and chunk_size == 64
++        and (
++            core_attn_out is None
++            or (
++                core_attn_out.is_cuda
++                and core_attn_out.dtype == torch.float16
++                and core_attn_out.is_contiguous()
++                and core_attn_out.numel() >= v.numel()
++            )
++        )
++        and all(
++            x.device == q.device and x.stride(-1) == 1 for x in (q, k, v, h)
++        )
++        and g.device == q.device
++        and cu_seqlens.device == q.device
++        and _is_sm75(q.device)
++    )
++    if not supported:
++        return reference_o(
++            q=q,
++            k=k,
++            v=v,
++            h=h,
++            g=g,
++            scale=scale,
++            cu_seqlens=cu_seqlens,
++            chunk_indices=chunk_indices,
++            chunk_size=chunk_size,
++            core_attn_out=core_attn_out,
++        )
++    if chunk_indices is None:
++        chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
++    if scale is None:
++        scale = q.shape[-1] ** -0.5
++    return load_turing_gdn_o()(
++        core_attn_out, q, k, v, h, g, cu_seqlens, chunk_indices, float(scale)
++    )

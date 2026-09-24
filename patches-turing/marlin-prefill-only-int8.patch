@@ -17,9 +17,11 @@ hunk; bounded KV staging is recommended to provide activation headroom.
 Tests: python bench/test_turing_marlin.py
 Measurements and quality gate: docs/turing-prefill.md.
 
+diff --git a/envs.py b/envs.py
+index 3aa3b13..71ab9ee 100755
 --- a/envs.py
 +++ b/envs.py
-@@ -185,6 +185,7 @@
+@@ -191,6 +191,7 @@ if TYPE_CHECKING:
      VLLM_RAY_EXTRA_ENV_VARS_TO_COPY: str = ""
      VLLM_MARLIN_USE_ATOMIC_ADD: bool = False
      VLLM_MARLIN_INPUT_DTYPE: Literal["int8", "fp8"] | None = None
@@ -27,7 +29,7 @@ Measurements and quality gate: docs/turing-prefill.md.
      VLLM_TURING_PREFILL_WINDOW: int = 0
      VLLM_TURING_EXTEND_MAX: int = 0
      VLLM_MARLIN_INT8_INCLUDE_RE: str = ""
-@@ -1536,6 +1537,9 @@
+@@ -1557,6 +1558,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
      # path (registered here so they take part in the torch.compile cache key)
      # These affect compiled/captured execution. Register them so compile_factors
      # separates artifacts when switching between baseline and SM75 experiments.
@@ -37,14 +39,16 @@ Measurements and quality gate: docs/turing-prefill.md.
      "VLLM_TURING_PREFILL_WINDOW": lambda: int(os.environ.get("VLLM_TURING_PREFILL_WINDOW", "0")),
      "VLLM_TURING_EXTEND_MAX": lambda: int(os.environ.get("VLLM_TURING_EXTEND_MAX", "0")),
      "VLLM_MARLIN_INT8_INCLUDE_RE": lambda: os.environ.get(
+diff --git a/model_executor/kernels/linear/mixed_precision/marlin.py b/model_executor/kernels/linear/mixed_precision/marlin.py
+index c7e177d..2377e54 100644
 --- a/model_executor/kernels/linear/mixed_precision/marlin.py
 +++ b/model_executor/kernels/linear/mixed_precision/marlin.py
-@@ -141,7 +141,17 @@
+@@ -141,7 +141,17 @@ class MarlinLinearKernel(MPLinearKernel):
          device = getattr(layer, self.w_q_name).device
          c = self.config
          is_a_8bit = c.act_type is not None and c.act_type.itemsize == 1
 -
-+        mode = os.environ.get("VLLM_TURING_PREFILL_INT8", "off")
++        mode = envs.VLLM_TURING_PREFILL_INT8
 +        if mode not in ("off", "mlp", "all"):
 +            raise ValueError("VLLM_TURING_PREFILL_INT8 must be off, mlp or all")
 +        prefix = getattr(layer, "prefix", "")
@@ -56,9 +60,9 @@ Measurements and quality gate: docs/turing-prefill.md.
 +            and (mode == "all" or "mlp" in prefix)
 +        )
          if is_a_8bit:
-             assert c.weight_type == scalar_types.uint4b8, (
-                 "W8A8 is not supported by marlin kernel."
-@@ -194,6 +204,11 @@
+             # syv patch (marlin-int8-asym-zp): the kernel set instantiates
+             # kS8 x kU4 (AWQ zero-point weights, int8 activations) next to
+@@ -197,6 +207,11 @@ class MarlinLinearKernel(MPLinearKernel):
              padded_n, padded_k = size_n, size_k
          else:
              padded_n, padded_k = marlin_padded_nk(size_n, size_k, c.group_size)
@@ -70,15 +74,17 @@ Measurements and quality gate: docs/turing-prefill.md.
  
          # Allocate marlin workspace, reusing existing storage on reload.
          self.workspace = marlin_make_workspace_new(
-@@ -347,4 +362,5 @@
+@@ -350,4 +365,5 @@ class MarlinLinearKernel(MPLinearKernel):
              input_global_scale=getattr(layer, "input_global_scale", None),
              bias=bias,
              input_dtype=c.act_type,
 +            prefill_int8=self.prefill_int8,
          )
+diff --git a/model_executor/layers/quantization/utils/marlin_utils.py b/model_executor/layers/quantization/utils/marlin_utils.py
+index cb90d62..dcb36fb 100644
 --- a/model_executor/layers/quantization/utils/marlin_utils.py
 +++ b/model_executor/layers/quantization/utils/marlin_utils.py
-@@ -721,7 +721,14 @@
+@@ -721,7 +721,14 @@ def apply_gptq_marlin_linear(
      bias: torch.Tensor | None = None,
      use_fp32_reduce: bool = USE_FP32_REDUCE_DEFAULT,
      input_dtype: torch.dtype | None = None,
@@ -93,6 +99,9 @@ Measurements and quality gate: docs/turing-prefill.md.
      reshaped_x = input.reshape(-1, input.shape[-1])
      out_shape = input.shape[:-1] + (output_size_per_partition,)
  
+diff --git a/model_executor/layers/quantization/utils/turing_marlin_prefill.py b/model_executor/layers/quantization/utils/turing_marlin_prefill.py
+new file mode 100644
+index 0000000..28de06d
 --- /dev/null
 +++ b/model_executor/layers/quantization/utils/turing_marlin_prefill.py
 @@ -0,0 +1,212 @@

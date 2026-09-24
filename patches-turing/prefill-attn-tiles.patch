@@ -7,9 +7,11 @@ fp16 operands with fp32 accumulators, one block per SM. Narrower warp tiles do
 not compile and wider ones spill; both were measured on the 64k and 256k
 shapes, and the shipped constants were the fastest of them.
 
+diff --git a/v1/attention/ops/turing_prefill_attn.py b/v1/attention/ops/turing_prefill_attn.py
+index bbe8787..f9d8941 100644
 --- a/v1/attention/ops/turing_prefill_attn.py
 +++ b/v1/attention/ops/turing_prefill_attn.py
-@@ -10,7 +10,7 @@
+@@ -10,7 +10,7 @@ import triton
  import triton.language as tl
  from torch.nn.attention import SDPBackend, sdpa_kernel
  from torch.nn.attention.bias import causal_lower_right
@@ -18,6 +20,88 @@ shapes, and the shipped constants were the fastest of them.
  
  
  @triton.jit
+diff --git a/v1/attention/ops/turing_prefill_tiles.cu b/v1/attention/ops/turing_prefill_tiles.cu
+new file mode 100644
+index 0000000..6736361
+--- /dev/null
++++ b/v1/attention/ops/turing_prefill_tiles.cu
+@@ -0,0 +1,73 @@
++// SM75 instantiation of the pinned PyTorch Cutlass attention template.
++// D256 and a 256-key tile keep the FP32 output accumulator in registers.
++#include <ATen/core/Tensor.h>
++#include <ATen/ops/empty.h>
++#include <c10/cuda/CUDAGuard.h>
++#include <c10/cuda/CUDAStream.h>
++#include <c10/cuda/CUDAException.h>
++#include <torch/library.h>
++#include "turing_kernel_forward.h"
++
++namespace qwen38_turing_prefill_tiles {
++using namespace PyTorchMemEffAttention;
++using Kernel = AttentionKernel<cutlass::half_t, cutlass::arch::Sm75,
++                               true, 32, 256, 256, false, false>;
++static_assert(!Kernel::kNeedsOutputAccumulatorBuffer);
++
++at::Tensor attention(const at::Tensor& q, const at::Tensor& k,
++                     const at::Tensor& v, double scale) {
++  TORCH_CHECK(q.is_cuda() && q.dim() == 4 && q.size(3) == 256 &&
++              q.stride(3) == 1, "q: CUDA [B,M,H,256]");
++  TORCH_CHECK(k.dim() == 3 && v.sizes() == k.sizes() &&
++              k.size(0) == q.size(0) && k.size(2) == 256,
++              "kv: [B,N,256]");
++  TORCH_CHECK(q.size(0) > 0 && q.size(2) > 0 &&
++              q.size(1) > 0 && q.size(1) <= k.size(1),
++              "nonempty causal lower-right shape");
++  for (const auto* t : {&q, &k, &v}) {
++    TORCH_CHECK(t->device() == q.device() && t->scalar_type() == at::kHalf &&
++                t->stride(t->dim() - 1) == 1, "FP16 input/device");
++  }
++  const c10::cuda::CUDAGuard guard(q.device());
++  cudaDeviceProp properties;
++  C10_CUDA_CHECK(cudaGetDeviceProperties(&properties, q.get_device()));
++  TORCH_CHECK(properties.major == 7 && properties.minor == 5,
++              "SM75 prefill requires a Turing GPU");
++  TORCH_CHECK(sizeof(Kernel::SharedStorage) <= properties.sharedMemPerBlockOptin,
++              "tile shared storage exceeds device capacity");
++  auto out = at::empty(q.sizes(), q.options());
++  Kernel::Params p;
++  p.query_ptr = reinterpret_cast<const cutlass::half_t*>(q.data_ptr());
++  p.key_ptr = reinterpret_cast<const cutlass::half_t*>(k.data_ptr());
++  p.value_ptr = reinterpret_cast<const cutlass::half_t*>(v.data_ptr());
++  p.output_ptr = reinterpret_cast<cutlass::half_t*>(out.data_ptr());
++  p.scale = scale;
++  p.head_dim = p.head_dim_value = 256;
++  p.num_batches = q.size(0);
++  p.num_queries = q.size(1);
++  p.num_heads = q.size(2);
++  p.num_keys = k.size(1);
++  p.q_strideB = q.stride(0); p.q_strideM = q.stride(1); p.q_strideH = q.stride(2);
++  p.k_strideB = k.stride(0); p.k_strideM = k.stride(1); p.k_strideH = 0;
++  p.v_strideB = v.stride(0); p.v_strideM = v.stride(1); p.v_strideH = 0;
++  p.o_strideM = out.stride(1);
++  p.custom_mask_type = Kernel::CausalFromBottomRight;
++  Kernel::check_supported(p);
++  auto fn = attention_kernel_batched_impl<Kernel>;
++  if (sizeof(Kernel::SharedStorage) > 48 * 1024) {
++    C10_CUDA_CHECK(cudaFuncSetAttribute(
++        fn, cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(Kernel::SharedStorage)));
++  }
++  fn<<<p.getBlocksGrid(), p.getThreadsGrid(), sizeof(Kernel::SharedStorage),
++       c10::cuda::getCurrentCUDAStream()>>>(p);
++  C10_CUDA_KERNEL_LAUNCH_CHECK();
++  return out;
++}
++} // namespace qwen38_turing_prefill_tiles
++
++TORCH_LIBRARY(qwen38_turing_prefill_tiles, m) {
++  m.def("attention(Tensor q, Tensor k, Tensor v, float scale) -> Tensor");
++}
++TORCH_LIBRARY_IMPL(qwen38_turing_prefill_tiles, CUDA, m) {
++  m.impl("attention", qwen38_turing_prefill_tiles::attention);
++}
+diff --git a/v1/attention/ops/turing_prefill_tiles.py b/v1/attention/ops/turing_prefill_tiles.py
+new file mode 100644
+index 0000000..22c8a80
 --- /dev/null
 +++ b/v1/attention/ops/turing_prefill_tiles.py
 @@ -0,0 +1,113 @@
@@ -134,79 +218,3 @@ shapes, and the shipped constants were the fastest of them.
 +    return load_turing_prefill_tiles()(
 +        q.permute(0, 2, 1, 3), k[:, 0], v[:, 0], scale
 +    ).permute(0, 2, 1, 3)
---- /dev/null
-+++ b/v1/attention/ops/turing_prefill_tiles.cu
-@@ -0,0 +1,73 @@
-+// SM75 instantiation of the pinned PyTorch Cutlass attention template.
-+// D256 and a 256-key tile keep the FP32 output accumulator in registers.
-+#include <ATen/core/Tensor.h>
-+#include <ATen/ops/empty.h>
-+#include <c10/cuda/CUDAGuard.h>
-+#include <c10/cuda/CUDAStream.h>
-+#include <c10/cuda/CUDAException.h>
-+#include <torch/library.h>
-+#include "turing_kernel_forward.h"
-+
-+namespace qwen38_turing_prefill_tiles {
-+using namespace PyTorchMemEffAttention;
-+using Kernel = AttentionKernel<cutlass::half_t, cutlass::arch::Sm75,
-+                               true, 32, 256, 256, false, false>;
-+static_assert(!Kernel::kNeedsOutputAccumulatorBuffer);
-+
-+at::Tensor attention(const at::Tensor& q, const at::Tensor& k,
-+                     const at::Tensor& v, double scale) {
-+  TORCH_CHECK(q.is_cuda() && q.dim() == 4 && q.size(3) == 256 &&
-+              q.stride(3) == 1, "q: CUDA [B,M,H,256]");
-+  TORCH_CHECK(k.dim() == 3 && v.sizes() == k.sizes() &&
-+              k.size(0) == q.size(0) && k.size(2) == 256,
-+              "kv: [B,N,256]");
-+  TORCH_CHECK(q.size(0) > 0 && q.size(2) > 0 &&
-+              q.size(1) > 0 && q.size(1) <= k.size(1),
-+              "nonempty causal lower-right shape");
-+  for (const auto* t : {&q, &k, &v}) {
-+    TORCH_CHECK(t->device() == q.device() && t->scalar_type() == at::kHalf &&
-+                t->stride(t->dim() - 1) == 1, "FP16 input/device");
-+  }
-+  const c10::cuda::CUDAGuard guard(q.device());
-+  cudaDeviceProp properties;
-+  C10_CUDA_CHECK(cudaGetDeviceProperties(&properties, q.get_device()));
-+  TORCH_CHECK(properties.major == 7 && properties.minor == 5,
-+              "SM75 prefill requires a Turing GPU");
-+  TORCH_CHECK(sizeof(Kernel::SharedStorage) <= properties.sharedMemPerBlockOptin,
-+              "tile shared storage exceeds device capacity");
-+  auto out = at::empty(q.sizes(), q.options());
-+  Kernel::Params p;
-+  p.query_ptr = reinterpret_cast<const cutlass::half_t*>(q.data_ptr());
-+  p.key_ptr = reinterpret_cast<const cutlass::half_t*>(k.data_ptr());
-+  p.value_ptr = reinterpret_cast<const cutlass::half_t*>(v.data_ptr());
-+  p.output_ptr = reinterpret_cast<cutlass::half_t*>(out.data_ptr());
-+  p.scale = scale;
-+  p.head_dim = p.head_dim_value = 256;
-+  p.num_batches = q.size(0);
-+  p.num_queries = q.size(1);
-+  p.num_heads = q.size(2);
-+  p.num_keys = k.size(1);
-+  p.q_strideB = q.stride(0); p.q_strideM = q.stride(1); p.q_strideH = q.stride(2);
-+  p.k_strideB = k.stride(0); p.k_strideM = k.stride(1); p.k_strideH = 0;
-+  p.v_strideB = v.stride(0); p.v_strideM = v.stride(1); p.v_strideH = 0;
-+  p.o_strideM = out.stride(1);
-+  p.custom_mask_type = Kernel::CausalFromBottomRight;
-+  Kernel::check_supported(p);
-+  auto fn = attention_kernel_batched_impl<Kernel>;
-+  if (sizeof(Kernel::SharedStorage) > 48 * 1024) {
-+    C10_CUDA_CHECK(cudaFuncSetAttribute(
-+        fn, cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(Kernel::SharedStorage)));
-+  }
-+  fn<<<p.getBlocksGrid(), p.getThreadsGrid(), sizeof(Kernel::SharedStorage),
-+       c10::cuda::getCurrentCUDAStream()>>>(p);
-+  C10_CUDA_KERNEL_LAUNCH_CHECK();
-+  return out;
-+}
-+} // namespace qwen38_turing_prefill_tiles
-+
-+TORCH_LIBRARY(qwen38_turing_prefill_tiles, m) {
-+  m.def("attention(Tensor q, Tensor k, Tensor v, float scale) -> Tensor");
-+}
-+TORCH_LIBRARY_IMPL(qwen38_turing_prefill_tiles, CUDA, m) {
-+  m.impl("attention", qwen38_turing_prefill_tiles::attention);
-+}

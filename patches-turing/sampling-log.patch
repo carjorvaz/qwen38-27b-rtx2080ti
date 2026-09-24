@@ -5,7 +5,8 @@ An OpenAI client that sends no sampling parameters gets the model's
 top_k=20, top_p=0.95`. That decides what speculation can do: greedy lookup
 drafting does not apply, and probabilistic drafting beats point-mass fills. This
 logs client address, prompt digest and the effective sampling parameters per
-request (`VLLM_SAMPLING_LOG=1`), so the traffic is visible instead of inferred.
+request, one unconditional INFO line per request, so the traffic is visible
+instead of inferred.
 
 Log the sampling parameters of every incoming request, once, at INFO: the
 source address identifies the client, the digest identifies the prompt
@@ -13,7 +14,41 @@ template, and temperature/top_p/top_k/min_p/tools/effort decide which speed
 features apply (the history lookup serves greedy requests only). Read-only.
 
 --- generated hunks below ---
---- a/entrypoints/openai/sampling_log.py
+
+diff --git a/entrypoints/openai/chat_completion/api_router.py b/entrypoints/openai/chat_completion/api_router.py
+index 291907a..ce31664 100644
+--- a/entrypoints/openai/chat_completion/api_router.py
++++ b/entrypoints/openai/chat_completion/api_router.py
+@@ -59,6 +59,10 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
+     if handler is None:
+         raise NotImplementedError("The model does not support Chat Completions API")
+ 
++    from vllm.entrypoints.openai.sampling_log import log_request
++
++    log_request(raw_request, "chat", request, request.messages)
++
+     generator = await handler.create_chat_completion(request, raw_request)
+ 
+     if isinstance(generator, ErrorResponse):
+diff --git a/entrypoints/openai/completion/api_router.py b/entrypoints/openai/completion/api_router.py
+index 7b33fcd..49e8ee1 100644
+--- a/entrypoints/openai/completion/api_router.py
++++ b/entrypoints/openai/completion/api_router.py
+@@ -52,6 +52,10 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
+     if handler is None:
+         raise NotImplementedError("The model does not support Completions API")
+ 
++    from vllm.entrypoints.openai.sampling_log import log_request
++
++    log_request(raw_request, "completion", request, request.prompt)
++
+     generator = await handler.create_completion(request, raw_request)
+ 
+     if isinstance(generator, ErrorResponse):
+diff --git a/entrypoints/openai/sampling_log.py b/entrypoints/openai/sampling_log.py
+new file mode 100644
+index 0000000..d98b094
+--- /dev/null
 +++ b/entrypoints/openai/sampling_log.py
 @@ -0,0 +1,80 @@
 +"""One INFO line per request describing the sampling parameters that arrived.
@@ -96,29 +131,3 @@ features apply (the history lookup serves greedy requests only). Read-only.
 +        getattr(request, "max_tokens", None)
 +        or getattr(request, "max_completion_tokens", None),
 +    )
---- a/entrypoints/openai/chat_completion/api_router.py
-+++ b/entrypoints/openai/chat_completion/api_router.py
-@@ -59,6 +59,10 @@
-     if handler is None:
-         raise NotImplementedError("The model does not support Chat Completions API")
- 
-+    from vllm.entrypoints.openai.sampling_log import log_request
-+
-+    log_request(raw_request, "chat", request, request.messages)
-+
-     generator = await handler.create_chat_completion(request, raw_request)
- 
-     if isinstance(generator, ErrorResponse):
---- a/entrypoints/openai/completion/api_router.py
-+++ b/entrypoints/openai/completion/api_router.py
-@@ -52,6 +52,10 @@
-     if handler is None:
-         raise NotImplementedError("The model does not support Completions API")
- 
-+    from vllm.entrypoints.openai.sampling_log import log_request
-+
-+    log_request(raw_request, "completion", request, request.prompt)
-+
-     generator = await handler.create_completion(request, raw_request)
- 
-     if isinstance(generator, ErrorResponse):

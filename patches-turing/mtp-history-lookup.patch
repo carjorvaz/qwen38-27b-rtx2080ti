@@ -20,6 +20,8 @@ copy work the lookup's value comes precisely from disagreeing with it. Keep
 sampled lookup opt-in, with the NMAX=64 gate for copy-heavy traffic.
 `NMIN`/`NMAX`/`SEARCH` bound the search.
 
+diff --git a/v1/spec_decode/llm_base_proposer.py b/v1/spec_decode/llm_base_proposer.py
+index 93c19a4..f8097d4 100644
 --- a/v1/spec_decode/llm_base_proposer.py
 +++ b/v1/spec_decode/llm_base_proposer.py
 @@ -1,6 +1,7 @@
@@ -30,7 +32,7 @@ sampled lookup opt-in, with the NMAX=64 gate for copy-heavy traffic.
  from importlib.util import find_spec
  from typing import TYPE_CHECKING, Any, cast
  
-@@ -23,6 +24,34 @@
+@@ -24,6 +25,34 @@ from vllm.distributed.eplb.eplb_state import EplbState
  from vllm.distributed.parallel_state import get_pp_group
  from vllm.forward_context import set_forward_context
  from vllm.logger import init_logger
@@ -65,7 +67,7 @@ sampled lookup opt-in, with the NMAX=64 gate for copy-heavy traffic.
  from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
  from vllm.model_executor.model_loader import get_model
  from vllm.model_executor.models import (
-@@ -81,6 +110,27 @@
+@@ -82,6 +111,27 @@ class SpecDecodeBaseProposer:
          self.speculative_config = vllm_config.speculative_config
          self.draft_model_config = self.speculative_config.draft_model_config
          self.method = self.speculative_config.method
@@ -93,7 +95,7 @@ sampled lookup opt-in, with the NMAX=64 gate for copy-heavy traffic.
          self.pass_hidden_states_to_model = pass_hidden_states_to_model
          self._share_mtp_indices = False
  
-@@ -504,6 +554,168 @@
+@@ -505,6 +555,168 @@ class SpecDecodeBaseProposer:
              )
          return draft_token_ids, draft_probs
  
@@ -262,7 +264,7 @@ sampled lookup opt-in, with the NMAX=64 gate for copy-heavy traffic.
      def take_last_draft_probs(self) -> torch.Tensor | None:
          return self._last_draft_probs
  
-@@ -530,6 +742,10 @@
+@@ -531,6 +743,10 @@ class SpecDecodeBaseProposer:
          self.num_speculative_tokens = num_speculative_tokens
          self._last_draft_probs = None
          batch_size = common_attn_metadata.batch_size()
@@ -273,9 +275,53 @@ sampled lookup opt-in, with the NMAX=64 gate for copy-heavy traffic.
  
          if self.method in ("eagle3", "dflash"):
              model = self.model
+diff --git a/v1/worker/gpu/spec_decode/dflash2/lookup.py b/v1/worker/gpu/spec_decode/dflash2/lookup.py
+index 0315b6e..901d3c6 100644
+--- a/v1/worker/gpu/spec_decode/dflash2/lookup.py
++++ b/v1/worker/gpu/spec_decode/dflash2/lookup.py
+@@ -47,6 +47,7 @@ def _suffix_lookup_kernel(
+     out_len_ptr,
+     out_valid_ptr,
+     search_max,
++    min_tail,
+     k: tl.constexpr,
+     NMAX: tl.constexpr,
+     NMIN: tl.constexpr,
+@@ -67,8 +68,11 @@ def _suffix_lookup_kernel(
+ 
+     # Candidate match ends run over [lo, hi): any position before the suffix's own end.
+     # A candidate may overlap the suffix (a period-p repetition matches at e = t - p),
+-    # which is how repeated list markers and indentation get proposed.
+-    hi = end_of_suffix
++    # which is how repeated list markers and indentation get proposed. `min_tail`
++    # keeps candidates that cannot fill a whole block out of the search: a nearby
++    # repeat with three tokens left would otherwise win the "most recent" tie-break
++    # against the copy it is a repeat of.
++    hi = end_of_suffix - min_tail
+     lo = tl.maximum(NMIN - 1, total_len - search_max)
+     best = tl.full([], -1, tl.int64)
+     for start in range(lo, hi, BLOCK):
+@@ -243,6 +247,7 @@ def suffix_lookup(
+     nmax: int = 32,
+     nmin: int = 4,
+     search_max: int = 1 << 30,
++    min_tail: int = 0,
+     out_tokens: torch.Tensor | None = None,
+     out_len: torch.Tensor | None = None,
+     out_valid: torch.Tensor | None = None,
+@@ -270,6 +275,7 @@ def suffix_lookup(
+         out_len,
+         out_valid,
+         search_max,
++        min_tail,
+         k=k,
+         NMAX=nmax,
+         NMIN=nmin,
+diff --git a/v1/worker/gpu_model_runner.py b/v1/worker/gpu_model_runner.py
+index e6ba7bc..22ddbc5 100644
 --- a/v1/worker/gpu_model_runner.py
 +++ b/v1/worker/gpu_model_runner.py
-@@ -5310,6 +5310,15 @@
+@@ -5266,6 +5266,15 @@ class GPUModelRunner(
                      next_token_ids, valid_sampled_tokens_count
                  )
  
@@ -291,43 +337,3 @@ sampled lookup opt-in, with the NMAX=64 gate for copy-heavy traffic.
              # Let the target override the hidden state fed to the drafter
              # (e.g. DeepSeek V4 MTP needs the pre-hc_head residual). Safe to
              # rebind here: hidden_states was already consumed for sampling
---- a/v1/worker/gpu/spec_decode/dflash2/lookup.py
-+++ b/v1/worker/gpu/spec_decode/dflash2/lookup.py
-@@ -47,6 +47,7 @@
-     out_len_ptr,
-     out_valid_ptr,
-     search_max,
-+    min_tail,
-     k: tl.constexpr,
-     NMAX: tl.constexpr,
-     NMIN: tl.constexpr,
-@@ -67,8 +68,11 @@
- 
-     # Candidate match ends run over [lo, hi): any position before the suffix's own end.
-     # A candidate may overlap the suffix (a period-p repetition matches at e = t - p),
--    # which is how repeated list markers and indentation get proposed.
--    hi = end_of_suffix
-+    # which is how repeated list markers and indentation get proposed. `min_tail`
-+    # keeps candidates that cannot fill a whole block out of the search: a nearby
-+    # repeat with three tokens left would otherwise win the "most recent" tie-break
-+    # against the copy it is a repeat of.
-+    hi = end_of_suffix - min_tail
-     lo = tl.maximum(NMIN - 1, total_len - search_max)
-     best = tl.full([], -1, tl.int64)
-     for start in range(lo, hi, BLOCK):
-@@ -243,6 +247,7 @@
-     nmax: int = 32,
-     nmin: int = 4,
-     search_max: int = 1 << 30,
-+    min_tail: int = 0,
-     out_tokens: torch.Tensor | None = None,
-     out_len: torch.Tensor | None = None,
-     out_valid: torch.Tensor | None = None,
-@@ -270,6 +275,7 @@
-         out_len,
-         out_valid,
-         search_max,
-+        min_tail,
-         k=k,
-         NMAX=nmax,
-         NMIN=nmin,

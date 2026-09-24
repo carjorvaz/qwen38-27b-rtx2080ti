@@ -1,9 +1,12 @@
 # Turing (SM75): Qwen3.8-27B on a 22 GB RTX 2080 Ti
 
 This branch adds a Turing port to the 3090 stack. `patches-turing/` is a
-24-patch series applied after `patches/`, on the same vLLM 0.28.0, and it runs the same
-serving setup on a card that is 8 GB smaller and one generation older: an RTX 2080 Ti with 22 GB, running at 280 W (the card's
-factory cap is 250 W).
+21-patch series applied after upstream's `patches/series`, on the same
+vLLM 0.29.0 pin, and it runs the same serving setup on a card that is 8 GB
+smaller and one generation older: an RTX 2080 Ti with 22 GB, running at 280 W
+(the card's factory cap is 250 W). The 0.29.0 rebase is recorded in
+[turing-0.29-port.md](turing-0.29-port.md); the numbers below are still the
+vLLM 0.28.0 measurements.
 
 The short version: 262,144 tokens of context out of a 5.5 GiB int4 KV pool,
 112 tok/s single-stream decode at 2k and 66 tok/s at 128k, with MTP speculation
@@ -41,7 +44,6 @@ otherwise produces wrong results or does not run.
 | `fp16-attn-verify` | prefill attention in fp16 with a packed-KV workspace | enables prefill at all on SM75 |
 | `fp16-drafter-units` | power-of-two unit shift so a bf16 checkpoint runs in fp16 | drafter loads without overflow |
 | `gdn-chunk-state` | chunked gated-delta-rule state update for SM75 | correctness on Turing |
-| `mamba-block-retirement` | frees the null gaps mamba prefill leaves | correctness (pool leak) |
 | `spec-decode-mma` | the verify attention kernel: fp16 MMA, split-KV, in-kernel dequant | the speculative path runs on Turing |
 | `mtp-history-lookup` | drafts from the context when the tail is already in it | 60k "reproduce this" 78.4 -> 90 tok/s, exact |
 | `mtp-prefix-checkpoint` | checkpoints recurrent state where prefix caching matched | correctness (prefix caching with a hybrid model) |
@@ -56,10 +58,16 @@ otherwise produces wrong results or does not run.
 | `spec-attn-register-softmax` | scores stay in the QK accumulators; 4-lane reductions and a 512 B (max, sum) exchange replace the 4.6 KiB score tile | layer 1.73 -> 1.22 ms at 131k; decode step 41.2 -> 39.0 / 46.6 -> 44.0 / 57.0 -> 52.9 ms at 32k/64k/128k |
 | `gdn-chunk-o` | native fp16 WMMA replacement for FLA's Triton chunk-output kernel, whose `tl.dot` lowers to SIMT on SM75 | 61.3 -> 14.8 ms per layer at T=32k (4.1x); cold 32k 36.3 -> 34.0 s, +32k tail at 48k 50.8 -> 48.6 s, to 128k 145.2 -> 140.8 s |
 | `gdn-state-16w` | the same state kernel at 16 warps instead of 4, same 48 KiB tile, bitwise identical output | 5.67 -> 1.98 ms per 2048-token chunk per layer (3.1x); cold 32k 34.0 -> 31.9 s, +32k tail at 48k 48.6 -> 46.3 s, to 128k 140.8 -> 135.9 s |
-| `sampling-log` | logs effective sampling parameters per request | tooling; explains why greedy-only lookup drafting |
-| `vllm-*` (3) | backports from vLLM after 0.28.0: SSE keep-alive, engine stall sentinel, completion log | operational |
+| `sampling-log` | logs effective sampling parameters per request (unconditional INFO line) | tooling; explains why greedy-only lookup drafting |
 | `prefill-memory-and-extend` | optional bounded KV staging and a separate small-query split-KV path | [follow-up measurements](turing-prefill.md) |
 | `marlin-prefill-only-int8` | optional transient W4A8 repacking for large-M target GEMMs; canonical decode weights stay intact | lossy prefill mode; [quality and limits](turing-prefill.md) |
+
+Four 0.28-era patches left the series at the 0.29 port because upstream carries
+them now: `mamba-block-retirement` (upstream's
+`mamba-align-retire-null-gaps.patch`, the same vLLM #55450 backport), the
+engine completion and stall-sentinel backports, and SSE keep-alive (native in
+vLLM 0.29.0). The tail patch `envs-knobs` registers the knobs below in
+`envs.py`; [turing-0.29-port.md](turing-0.29-port.md) has the details.
 
 Standalone GPU tests cover the native kernels, with no model and no server:
 `python bench/test_turing_prefill.py`, `bench/test_turing_marlin.py`, and
@@ -68,8 +76,9 @@ references, plus timing).
 
 ## Running it
 
-Install vLLM 0.28.0, apply both patch directories (`patches-turing/README.md`
-has the command), and launch with the flags this was measured with:
+Install vLLM 0.29.0, apply both patch directories in their `series` order
+(`patches-turing/README.md` has the command), and launch with the flags this
+was measured with:
 
 ```bash
 vllm serve models/Qwen3.8-27B-W4A16-AutoRound \
@@ -99,10 +108,13 @@ Knobs this series adds, all optional:
 | `VLLM_MTP_LOOKUP` | `0` | enable the context-lookup drafts (greedy requests only) |
 | `VLLM_MTP_LOOKUP_MIN` | `24` | shortest tail worth looking up |
 | `VLLM_MTP_LOOKUP_SAMPLED` | `0` | allow the lookup on sampled requests too; task-dependent (+17% copy, −9.5% free-form prose at 23k), see [turing-prefill.md](turing-prefill.md) |
+| `VLLM_MTP_LOOKUP_NMIN` | `4` | shortest matched suffix the lookup may take on its own |
+| `VLLM_MTP_LOOKUP_NMAX` | `32` | longest suffix the lookup matches; caps the requested draft block |
+| `VLLM_MTP_LOOKUP_SEARCH` | `1073741824` | history window, in tokens, the lookup searches back through |
 | `VLLM_TURING_PREFILL_TILE` | `256` | key-tile width for the prefill kernel; `0` selects the portable fallback |
 | `VLLM_TURING_SPEC_NSEG` | `32` | split-KV partials in the verify attention |
 | `VLLM_TURING_GDN_STATE` | `1` | `0` restores the upstream chunk-state path |
-| `VLLM_SAMPLING_LOG` | `0` | per-request client address, prompt digest and sampling parameters |
+| `VLLM_TURING_GDN_O` | `1` | `0` restores FLA's Triton chunk-output kernel |
 | `VLLM_ENGINE_STALL_SENTINEL_S` | unset | seconds without an engine iteration before it logs and aborts |
 | `VLLM_TURING_PREFILL_WINDOW` | `0` | bounded FP16 staging window; `16384` reduces memory, `0` retains full-context staging |
 | `VLLM_TURING_EXTEND_MAX` | `0` | separate split-KV path up to this query length; `32` is the measured candidate |
@@ -238,7 +250,7 @@ Kept here so nobody re-derives them:
   streams needs a second KV pool, about 5.97 GiB beyond what the card has spare
   at 262k.
 - The Docker and compose paths in this repo build for the 3090's CUDA arch
-  list; they are not wired for Turing. Apply the series to a local vLLM 0.28.0
+  list; they are not wired for Turing. Apply the series to a local vLLM 0.29.0
   environment instead.
 - The int4 3D-scratch attention variant boots but is not faster here; its
   workspace is capped so a large block cannot over-allocate.
@@ -252,5 +264,5 @@ Kept here so nobody re-derives them:
 
 Fork of [syv-ai/HyperQwen](https://github.com/syv-ai/HyperQwen) (formerly
 `syv-ai/qwen38-27b-rtx3090`), whose 3090 stack, preparation scripts and
-benchmark harness this series builds on and does not replace. The patches here modify vLLM 0.28.0; both are
+benchmark harness this series builds on and does not replace. The patches here modify vLLM 0.29.0; both are
 Apache-2.0, see `LICENSE`.

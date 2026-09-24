@@ -6,6 +6,8 @@ with the fp32 recurrent state kept in registers, publishing its fp16 pre-chunk
 snapshot for the chunked path. `VLLM_TURING_GDN_STATE=0` selects the original
 implementation.
 
+diff --git a/third_party/flash_linear_attention/ops/chunk.py b/third_party/flash_linear_attention/ops/chunk.py
+index caf8b0c..e07df08 100644
 --- a/third_party/flash_linear_attention/ops/chunk.py
 +++ b/third_party/flash_linear_attention/ops/chunk.py
 @@ -10,7 +10,7 @@
@@ -17,128 +19,9 @@ implementation.
  from .chunk_o import chunk_fwd_o
  from .chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
  from .cumsum import chunk_local_cumsum
---- /dev/null
-+++ b/third_party/flash_linear_attention/ops/turing_gdn.py
-@@ -0,0 +1,119 @@
-+"""SM75 GDN chunk-state update with FP16 MMA and FP32 recurrent accumulation.
-+
-+The original FLA implementation remains the reference and fallback. Load this
-+extension before graph capture; the supported path never reads sequence metadata
-+back to the host. VLLM_TURING_GDN_STATE=0 retains the original implementation.
-+"""
-+
-+from functools import cache
-+import os
-+from pathlib import Path
-+
-+import torch
-+
-+from .chunk_delta_h import chunk_gated_delta_rule_fwd_h as reference_state
-+from .index import prepare_chunk_indices, prepare_chunk_offsets
-+
-+
-+@cache
-+def _is_sm75(device):
-+    return torch.cuda.get_device_capability(device) == (7, 5)
-+
-+
-+@cache
-+def load_turing_gdn():
-+    from torch.utils.cpp_extension import load
-+
-+    load(
-+        name="qwen38_turing_gdn",
-+        sources=[str(Path(__file__).with_suffix(".cu"))],
-+        extra_cflags=["-O3", "-std=c++17"],
-+        extra_cuda_cflags=[
-+            "-O3",
-+            "-std=c++17",
-+            "-gencode=arch=compute_75,code=sm_75",
-+        ],
-+        is_python_module=False,
-+    )
-+    return torch.ops.qwen38_turing_gdn.state.default
-+
-+
-+def chunk_gated_delta_rule_fwd_h(
-+    k,
-+    w,
-+    u,
-+    g=None,
-+    gk=None,
-+    initial_state=None,
-+    output_final_state=False,
-+    chunk_size=64,
-+    save_new_value=True,
-+    cu_seqlens=None,
-+    chunk_indices=None,
-+    chunk_offsets=None,
-+    use_exp2=False,
-+):
-+    supported = (
-+        os.environ.get("VLLM_TURING_GDN_STATE", "1") == "1"
-+        and k.is_cuda
-+        and k.dtype == torch.float16
-+        and k.ndim == 4
-+        and k.shape[0] == 1
-+        and k.shape[1] > 0
-+        and k.shape[-1] == 128
-+        and w.dtype == u.dtype == torch.float16
-+        and w.shape == u.shape
-+        and u.ndim == 4
-+        and u.shape[:2] == k.shape[:2]
-+        and u.shape[-1] == 128
-+        and k.shape[2] > 0
-+        and u.shape[2] > 0
-+        and u.shape[2] % k.shape[2] == 0
-+        and chunk_size == 64
-+        and g is not None
-+        and g.dtype == torch.float32
-+        and g.shape == u.shape[:3]
-+        and gk is None
-+        and not use_exp2
-+        and save_new_value
-+        and cu_seqlens is not None
-+        and cu_seqlens.dtype == torch.int32
-+        and cu_seqlens.is_contiguous()
-+        and all(x.device == k.device and x.stride(-1) == 1 for x in (k, w, u))
-+        and g.device == cu_seqlens.device == k.device
-+        and (
-+            initial_state is None
-+            or (
-+                initial_state.device == k.device
-+                and initial_state.dtype in (torch.float16, torch.float32)
-+                and initial_state.shape
-+                == (cu_seqlens.numel() - 1, u.shape[2], 128, 128)
-+                and initial_state.stride(-1) == 1
-+            )
-+        )
-+        and _is_sm75(k.device)
-+    )
-+    if not supported:
-+        return reference_state(
-+            k,
-+            w,
-+            u,
-+            g,
-+            gk,
-+            initial_state,
-+            output_final_state,
-+            chunk_size,
-+            save_new_value,
-+            cu_seqlens,
-+            chunk_indices,
-+            chunk_offsets,
-+            use_exp2,
-+        )
-+    if chunk_indices is None:
-+        chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
-+    if chunk_offsets is None:
-+        chunk_offsets = prepare_chunk_offsets(cu_seqlens, chunk_size)
-+    h, v_new, final_state = load_turing_gdn()(
-+        k, w, u, g, initial_state, cu_seqlens, chunk_offsets, len(chunk_indices)
-+    )
-+    return h, v_new, final_state if output_final_state else None
+diff --git a/third_party/flash_linear_attention/ops/turing_gdn.cu b/third_party/flash_linear_attention/ops/turing_gdn.cu
+new file mode 100644
+index 0000000..29af902
 --- /dev/null
 +++ b/third_party/flash_linear_attention/ops/turing_gdn.cu
 @@ -0,0 +1,251 @@
@@ -393,3 +276,128 @@ implementation.
 +        "cu, Tensor offsets, int total_chunks) -> (Tensor, Tensor, Tensor)");
 +}
 +TORCH_LIBRARY_IMPL(qwen38_turing_gdn, CUDA, m) { m.impl("state", state); }
+diff --git a/third_party/flash_linear_attention/ops/turing_gdn.py b/third_party/flash_linear_attention/ops/turing_gdn.py
+new file mode 100644
+index 0000000..c5467e1
+--- /dev/null
++++ b/third_party/flash_linear_attention/ops/turing_gdn.py
+@@ -0,0 +1,119 @@
++"""SM75 GDN chunk-state update with FP16 MMA and FP32 recurrent accumulation.
++
++The original FLA implementation remains the reference and fallback. Load this
++extension before graph capture; the supported path never reads sequence metadata
++back to the host. VLLM_TURING_GDN_STATE=0 retains the original implementation.
++"""
++
++from functools import cache
++import os
++from pathlib import Path
++
++import torch
++
++from .chunk_delta_h import chunk_gated_delta_rule_fwd_h as reference_state
++from .index import prepare_chunk_indices, prepare_chunk_offsets
++
++
++@cache
++def _is_sm75(device):
++    return torch.cuda.get_device_capability(device) == (7, 5)
++
++
++@cache
++def load_turing_gdn():
++    from torch.utils.cpp_extension import load
++
++    load(
++        name="qwen38_turing_gdn",
++        sources=[str(Path(__file__).with_suffix(".cu"))],
++        extra_cflags=["-O3", "-std=c++17"],
++        extra_cuda_cflags=[
++            "-O3",
++            "-std=c++17",
++            "-gencode=arch=compute_75,code=sm_75",
++        ],
++        is_python_module=False,
++    )
++    return torch.ops.qwen38_turing_gdn.state.default
++
++
++def chunk_gated_delta_rule_fwd_h(
++    k,
++    w,
++    u,
++    g=None,
++    gk=None,
++    initial_state=None,
++    output_final_state=False,
++    chunk_size=64,
++    save_new_value=True,
++    cu_seqlens=None,
++    chunk_indices=None,
++    chunk_offsets=None,
++    use_exp2=False,
++):
++    supported = (
++        os.environ.get("VLLM_TURING_GDN_STATE", "1") == "1"
++        and k.is_cuda
++        and k.dtype == torch.float16
++        and k.ndim == 4
++        and k.shape[0] == 1
++        and k.shape[1] > 0
++        and k.shape[-1] == 128
++        and w.dtype == u.dtype == torch.float16
++        and w.shape == u.shape
++        and u.ndim == 4
++        and u.shape[:2] == k.shape[:2]
++        and u.shape[-1] == 128
++        and k.shape[2] > 0
++        and u.shape[2] > 0
++        and u.shape[2] % k.shape[2] == 0
++        and chunk_size == 64
++        and g is not None
++        and g.dtype == torch.float32
++        and g.shape == u.shape[:3]
++        and gk is None
++        and not use_exp2
++        and save_new_value
++        and cu_seqlens is not None
++        and cu_seqlens.dtype == torch.int32
++        and cu_seqlens.is_contiguous()
++        and all(x.device == k.device and x.stride(-1) == 1 for x in (k, w, u))
++        and g.device == cu_seqlens.device == k.device
++        and (
++            initial_state is None
++            or (
++                initial_state.device == k.device
++                and initial_state.dtype in (torch.float16, torch.float32)
++                and initial_state.shape
++                == (cu_seqlens.numel() - 1, u.shape[2], 128, 128)
++                and initial_state.stride(-1) == 1
++            )
++        )
++        and _is_sm75(k.device)
++    )
++    if not supported:
++        return reference_state(
++            k,
++            w,
++            u,
++            g,
++            gk,
++            initial_state,
++            output_final_state,
++            chunk_size,
++            save_new_value,
++            cu_seqlens,
++            chunk_indices,
++            chunk_offsets,
++            use_exp2,
++        )
++    if chunk_indices is None:
++        chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
++    if chunk_offsets is None:
++        chunk_offsets = prepare_chunk_offsets(cu_seqlens, chunk_size)
++    h, v_new, final_state = load_turing_gdn()(
++        k, w, u, g, initial_state, cu_seqlens, chunk_offsets, len(chunk_indices)
++    )
++    return h, v_new, final_state if output_final_state else None

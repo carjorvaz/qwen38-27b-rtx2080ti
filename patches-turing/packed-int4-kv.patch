@@ -7,6 +7,327 @@ the prefill and verify paths. This is what lets 262,144 tokens of context live
 in 5.5 GiB here. These kernels use fp16/fp32 dots; Turing's integer tensor
 cores require a different kernel layout and are not used by this patch.
 
+diff --git a/v1/attention/backends/flash_attn.py b/v1/attention/backends/flash_attn.py
+index 7dabed2..22757ef 100755
+--- a/v1/attention/backends/flash_attn.py
++++ b/v1/attention/backends/flash_attn.py
+@@ -1953,12 +1953,19 @@ def _spec_attn_run(impl, q, key_cache, value_cache, out, cu_seqlens_q, seqused_k
+     # scheduler's capacity from model construction, not a guessed 256 requests.
+     num_reqs = cu_seqlens_q.shape[0] - 1
+     max_reqs = max(impl._spec_attn_max_reqs or num_reqs, num_reqs)
+-    key = (impl.num_heads, impl.head_size, q.device, max_reqs)
++    packed_int4 = (
++        key_cache.dtype == torch.uint8 and impl.kv_cache_dtype == "int4_per_token_head"
++    )
++    key = (impl.num_heads, impl.head_size, q.device, max_reqs, packed_int4)
+     att = _SPEC_ATTN.get(key)
+     if att is None:
+         att = SpecDecodeAttention(
+-            max_reqs, impl.num_heads, impl.head_size, q.device,
++            max_reqs,
++            impl.num_heads,
++            impl.head_size,
++            q.device,
+             qmax=_spec_attn_qmax(impl.num_heads // impl.num_kv_heads),
++            packed_int4=packed_int4,
+         )
+         _SPEC_ATTN[key] = att
+     att.run(q, key_cache, value_cache, out, cu_seqlens_q, seqused_k, block_table, impl.scale,
+diff --git a/v1/attention/backends/triton_attn.py b/v1/attention/backends/triton_attn.py
+index 28bf881..f46a39f 100644
+--- a/v1/attention/backends/triton_attn.py
++++ b/v1/attention/backends/triton_attn.py
+@@ -747,7 +747,12 @@ class TritonAttentionImpl(AttentionImpl):
+             and current_platform.is_device_capability(75)
+             and vllm_config.model_config.dtype == torch.float16
+             and head_size == 256
+-            and self._kv_quant_mode in (KVQuantMode.NONE, KVQuantMode.INT8_PER_TOKEN_HEAD)
++            and self._kv_quant_mode
++            in (
++                KVQuantMode.NONE,
++                KVQuantMode.INT8_PER_TOKEN_HEAD,
++                KVQuantMode.INT4_PER_TOKEN_HEAD,
++            )
+             and attn_type == AttentionType.DECODER
+             and self.sliding_window == (-1, -1)
+             and not self.logits_soft_cap
+@@ -883,14 +888,24 @@ class TritonAttentionImpl(AttentionImpl):
+ 
+         mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
+ 
++        native_int4 = (
++            self._kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD
++            and current_platform.is_cuda()
++            and current_platform.is_device_capability(75)
++            and query.dtype == torch.float16
++            and self.head_size == 256
++            and 1 <= self.num_heads // self.num_kv_heads <= 32
++            and k_scale_cache is not None
++            and v_scale_cache is not None
++        )
+         # syv patch: the split-KV Triton verify attention (patches/spec-decode-attn.patch),
+         # which vLLM's own unified attention cannot do here -- it refuses to split the KV
+         # sequence whenever max_seqlen_q > 1 (triton_unified_attention.py, `use_3d`), and
+         # every DFlash2 step is a multi-query verify. Measured at a 128k context, 8 query
+         # tokens: 1.3 ms per layer against unified attention's 7.4 ms.
+-        # FP16 unquantized KV and int8 per-token-head KV: for int8 the kernel folds
+-        # the per-(token, head) scales in after each dot because they are constant
+-        # along the head dim. Other unquantized dtypes keep their existing path.
++        # FP16 and INT8 retain their existing path. Native SM75 INT4 also
++        # handles single-token decode: tiles unpack centered nibbles, while
++        # query/output RHT uses graph-stable scratch, never a full KV unpack.
+         # The drafter's own sliding-window layers are excluded below.
+         # fp8 per-tensor (vLLM's `fp8` cache, sm89+): the same kernel reads fp8 e4m3 and folds the
+         # layer's scalar k/v scales in after each dot; it is what keeps FULL graphs and the split
+@@ -924,12 +939,14 @@ class TritonAttentionImpl(AttentionImpl):
+                     and key_cache.dtype == torch.float16
+                     and value_cache.dtype == torch.float16
+                 )
++                or native_int4
+             )
+             and 16 <= self.head_size <= 256
+             and self.head_size & (self.head_size - 1) == 0
+             and self.num_heads % self.num_kv_heads == 0
+             and key_cache.shape[1] % 16 == 0
+-            and 1 < max_seqlen_q <= _spec_attn_qmax(self.num_heads // self.num_kv_heads)
++            and (1 <= max_seqlen_q if native_int4 else 1 < max_seqlen_q)
++            and max_seqlen_q <= _spec_attn_qmax(self.num_heads // self.num_kv_heads)
+             and attn_metadata.causal
+             and (self.sliding_window is None or self.sliding_window == (-1, -1))
+             and not self.logits_soft_cap
+diff --git a/v1/attention/ops/spec_decode_attn.py b/v1/attention/ops/spec_decode_attn.py
+index 506ac5d..a7b9b1b 100644
+--- a/v1/attention/ops/spec_decode_attn.py
++++ b/v1/attention/ops/spec_decode_attn.py
+@@ -195,8 +195,16 @@ def _spec_attn_combine(
+ class SpecDecodeAttention:
+     """Holds the partial buffers; call .run(...) per layer."""
+ 
+-    def __init__(self, max_num_reqs, num_heads, head_dim, device, qmax,
+-                 num_segments=None):
++    def __init__(
++        self,
++        max_num_reqs,
++        num_heads,
++        head_dim,
++        device,
++        qmax,
++        num_segments=None,
++        packed_int4=False,
++    ):
+         # The partial buffers are allocated once, for the longest query block the caller
+         # will ever pass (qmax): a CUDA graph captures their addresses, so growing them
+         # later would leave the captured decode graph pointing at freed memory.
+@@ -220,10 +228,25 @@ class SpecDecodeAttention:
+         self.part_o = torch.empty(n, head_dim, dtype=torch.float32, device=device)
+         self.part_m = torch.empty(n, dtype=torch.float32, device=device)
+         self.part_l = torch.empty(n, dtype=torch.float32, device=device)
++        self.packed_int4 = packed_int4
++        if packed_int4:
++            assert self.turing_partial is not None, "packed INT4 requires SM75 D256"
++            from vllm.v1.attention.ops.int4_per_token_head import _get_rht_signs
++            from vllm.v1.attention.ops.turing_spec_attn import load_turing_rht
++
++            self.rht = load_turing_rht()
++            self.rht_signs = _get_rht_signs(head_dim, 0, device)
++            shape = (max_num_reqs * qmax, num_heads, head_dim)
++            self.rotated_query = torch.empty(shape, dtype=torch.float16, device=device)
++            self.rotated_output = torch.empty(shape, dtype=torch.float32, device=device)
+ 
+     def _plan(self, q_len, G, D):
+         """(BLOCK_M, tokens per tile, tile count, warps). One tile is preferred: every
+         extra tile re-reads this request's KV segment."""
++        if self.packed_int4:
++            assert 1 <= G <= 32
++            qt = 32 // G
++            return 32, qt, triton.cdiv(q_len, qt), 4
+         override = envs.VLLM_SPEC_ATTN_BLOCK_M
+         rows = q_len * G
+         if override:
+@@ -246,7 +269,8 @@ class SpecDecodeAttention:
+             k_descale=None, v_descale=None, q_descale=None):
+         """key/value_cache: [num_blocks, block_size, Hkv, D] fp16/bf16, or
+         [.., D + pad] int8 with k/v_scale_cache [num_blocks, block_size, Hkv]
+-        float32 (per-token-head int8), or [.., D] fp8 e4m3 with k/v_descale
++        float32 (per-token-head int8), or [.., D // 2 + pad] packed UINT8 INT4
++        using the same RHT/scale-bit format, or [.., D] fp8 e4m3 with k/v_descale
+         one-element float32 tensors (vLLM's per-tensor `fp8`). Unquantized
+         caches take no scale buffers."""
+         Hq, D = q.shape[1], q.shape[2]
+@@ -261,6 +285,16 @@ class SpecDecodeAttention:
+             assert q_descale is not None, "fp8 query needs its descale"
+         assert max_query_len <= self.qmax, "too many query tokens per request for this kernel"
+         assert num_reqs <= self.max_num_reqs
++        assert (key_cache.dtype == torch.uint8) == self.packed_int4
++        final_out = out
++        if self.packed_int4:
++            assert q.dtype == out.dtype == torch.float16
++            assert q.shape[0] <= self.rotated_query.shape[0]
++            rotated_query = self.rotated_query[: q.shape[0]]
++            self.rht(q, rotated_query, self.rht_signs, False, cu_seqlens_q, num_reqs)
++            q = rotated_query
++            scale /= D
++            out = self.rotated_output[: out.shape[0]]
+         # Turing has 64 KiB shared memory; Ampere's 99 KiB tile does not fit.
+         block_m, qt, ntile, warps = self._plan(max_query_len, G, D)
+         tile = 64 if (block_m <= 32 or D <= 128) else 32
+@@ -315,4 +349,6 @@ class SpecDecodeAttention:
+             import time as _t
+             torch.cuda.synchronize(); print(f"syv spec-attn run#{self._dbg_calls}: kernel pair took {(_t.perf_counter() - self._dbg_t0) * 1e6:.0f} us", flush=True)
+             self._dbg_t0 = None
+-        return out
++        if self.packed_int4:
++            self.rht(out, final_out, self.rht_signs, True, cu_seqlens_q, num_reqs)
++        return final_out
+diff --git a/v1/attention/ops/turing_prefill_attn.py b/v1/attention/ops/turing_prefill_attn.py
+index ec9ebd1..bbe8787 100644
+--- a/v1/attention/ops/turing_prefill_attn.py
++++ b/v1/attention/ops/turing_prefill_attn.py
+@@ -15,11 +15,34 @@ from torch.nn.functional import scaled_dot_product_attention
+ 
+ @triton.jit
+ def _gather_kv(
+-    k, v, ks, vs, table, dst_k, dst_v, n,
+-    kb, kt, kh, kd, vb, vt, vh, vd,
+-    ksb, kst, ksh, vsb, vst, vsh,
+-    capacity: tl.constexpr, D: tl.constexpr, BLOCK: tl.constexpr,
+-    QUANT: tl.constexpr, ROWS: tl.constexpr,
++    k,
++    v,
++    ks,
++    vs,
++    table,
++    dst_k,
++    dst_v,
++    n,
++    kb,
++    kt,
++    kh,
++    kd,
++    vb,
++    vt,
++    vh,
++    vd,
++    ksb,
++    kst,
++    ksh,
++    vsb,
++    vst,
++    vsh,
++    capacity: tl.constexpr,
++    D: tl.constexpr,
++    BLOCK: tl.constexpr,
++    QUANT: tl.constexpr,
++    PACKED: tl.constexpr,
++    ROWS: tl.constexpr,
+ ):
+     head = tl.program_id(1)
+     pos = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
+@@ -27,13 +50,38 @@ def _gather_kv(
+     valid = pos < n
+     block = tl.load(table + pos // BLOCK, mask=valid, other=0)
+     slot = pos % BLOCK
+-    kval = tl.load(k + block[:, None] * kb + slot[:, None] * kt
+-                   + head * kh + dim[None, :] * kd, mask=valid[:, None], other=0)
+-    vval = tl.load(v + block[:, None] * vb + slot[:, None] * vt
+-                   + head * vh + dim[None, :] * vd, mask=valid[:, None], other=0)
++    cache_dim = dim // 2 if PACKED else dim
++    kval = tl.load(
++        k
++        + block[:, None] * kb
++        + slot[:, None] * kt
++        + head * kh
++        + cache_dim[None, :] * kd,
++        mask=valid[:, None],
++        other=0,
++    )
++    vval = tl.load(
++        v
++        + block[:, None] * vb
++        + slot[:, None] * vt
++        + head * vh
++        + cache_dim[None, :] * vd,
++        mask=valid[:, None],
++        other=0,
++    )
+     if QUANT:
+         kscale = tl.load(ks + block * ksb + slot * kst + head * ksh, mask=valid, other=0)
+         vscale = tl.load(vs + block * vsb + slot * vst + head * vsh, mask=valid, other=0)
++        if PACKED:
++            kbits = kscale.to(tl.int32, bitcast=True)
++            vbits = vscale.to(tl.int32, bitcast=True)
++            kzero = kbits & 15
++            vzero = vbits & 15
++            kscale = (kbits & -16).to(tl.float32, bitcast=True)
++            vscale = (vbits & -16).to(tl.float32, bitcast=True)
++            shift = (dim[None, :] & 1) * 4
++            kval = ((kval.to(tl.int32) >> shift) & 15) - kzero[:, None]
++            vval = ((vval.to(tl.int32) >> shift) & 15) - vzero[:, None]
+         kval = kval.to(tl.float32) * kscale[:, None]
+         vval = vval.to(tl.float32) * vscale[:, None]
+     offset = (head * capacity + pos[:, None]) * D + dim[None, :]
+@@ -60,15 +108,44 @@ class TuringPrefillAttention:
+         assert q.dtype == out.dtype == torch.float16
+         quant = k_scale_cache is not None
+         assert (v_scale_cache is not None) == quant
+-        assert k.dtype == v.dtype == (torch.int8 if quant else torch.float16)
++        packed = k.dtype == torch.uint8
++        assert (
++            k.dtype
++            == v.dtype
++            == (torch.uint8 if packed else torch.int8 if quant else torch.float16)
++        )
++        assert not packed or (quant and dim == 256)
++        if packed:
++            from vllm.v1.attention.ops.int4_per_token_head import _get_rht_signs
++            from vllm.v1.attention.ops.turing_spec_attn import load_turing_rht
++
++            rht = load_turing_rht()
++            signs = _get_rht_signs(dim, 0, q.device)
++            # The caller's output doubles as rotated Q until SDPA returns.
++            rht(q, out, signs, False)
++            q = out
++            scale /= dim
+         _gather_kv[(triton.cdiv(num_keys, 16), self.num_kv_heads)](
+-            k, v, k_scale_cache, v_scale_cache, block_table,
+-            self.key, self.value, num_keys,
+-            *k.stride(), *v.stride(),
++            k,
++            v,
++            k_scale_cache,
++            v_scale_cache,
++            block_table,
++            self.key,
++            self.value,
++            num_keys,
++            *k.stride(),
++            *v.stride(),
+             *(k_scale_cache.stride() if quant else (0, 0, 0)),
+             *(v_scale_cache.stride() if quant else (0, 0, 0)),
+-            capacity=self.capacity, D=dim, BLOCK=k.shape[1], QUANT=quant,
+-            ROWS=16, num_warps=4, num_stages=1,
++            capacity=self.capacity,
++            D=dim,
++            BLOCK=k.shape[1],
++            QUANT=quant,
++            PACKED=packed,
++            ROWS=16,
++            num_warps=4,
++            num_stages=1,
+         )
+         group = num_heads // self.num_kv_heads
+         shape = (num_queries, num_keys, num_heads)
+@@ -87,6 +164,8 @@ class TuringPrefillAttention:
+         # Cutlass returns grouped BSHD storage. Copy straight into the caller's
+         # output view; do not materialize a second transposed intermediate.
+         out.view(num_queries, self.num_kv_heads, group, dim).permute(1, 2, 0, 3).copy_(result)
++        if packed:
++            rht(out, out, signs, True)
+         return out
+ 
+ 
+diff --git a/v1/attention/ops/turing_spec_attn.cu b/v1/attention/ops/turing_spec_attn.cu
+index a82479d..4183e34 100644
 --- a/v1/attention/ops/turing_spec_attn.cu
 +++ b/v1/attention/ops/turing_spec_attn.cu
 @@ -16,6 +16,7 @@
@@ -17,7 +338,7 @@ cores require a different kernel layout and are not used by this patch.
  
  namespace {
  
-@@ -60,6 +61,8 @@
+@@ -60,6 +61,8 @@ struct __align__(16) Shared {
    float alpha[kRows];
    float k_scale[kKeys];
    float v_scale[kKeys];
@@ -26,7 +347,7 @@ cores require a different kernel layout and are not used by this patch.
    int64_t q_offset[kRows];
    int64_t output_row[kRows];
    int64_t q_position[kRows];
-@@ -104,13 +107,18 @@
+@@ -104,13 +107,18 @@ __device__ __forceinline__ void mma(Accumulator &c, uint32_t a0, uint32_t a1,
                 : "r"(a0), "r"(a1), "r"(b));
  }
  
@@ -50,7 +371,7 @@ cores require a different kernel layout and are not used by this patch.
    }
  }
  
-@@ -147,7 +155,7 @@
+@@ -147,7 +155,7 @@ __device__ __forceinline__ void save_score(Shared &s, int row, int column,
    }
  }
  
@@ -59,7 +380,7 @@ cores require a different kernel layout and are not used by this patch.
  __global__ __launch_bounds__(kThreads) void partial_kernel(Params p) {
    __shared__ Shared s;
    const int tid = threadIdx.x;
-@@ -245,6 +253,15 @@
+@@ -245,6 +253,15 @@ __global__ __launch_bounds__(kThreads) void partial_kernel(Params p) {
                p.vs[static_cast<int64_t>(page) * p.vs_block_stride +
                     static_cast<int64_t>(slot) * p.vs_token_stride +
                     static_cast<int64_t>(kv_head) * p.vs_head_stride];
@@ -75,7 +396,7 @@ cores require a different kernel layout and are not used by this patch.
          }
        } else {
          // Neither the page table nor any cache/scale entry is read for tails.
-@@ -262,8 +279,10 @@
+@@ -262,8 +279,10 @@ __global__ __launch_bounds__(kThreads) void partial_kernel(Params p) {
        const int row = index / kDim;
        const int dim = index % kDim;
        const int64_t offset = s.k_offset[row];
@@ -88,7 +409,7 @@ cores require a different kernel layout and are not used by this patch.
      }
      __syncthreads();
  
-@@ -323,8 +342,10 @@
+@@ -323,8 +342,10 @@ __global__ __launch_bounds__(kThreads) void partial_kernel(Params p) {
        const int row = index / kDim;
        const int dim = index % kDim;
        const int64_t offset = s.v_offset[row];
@@ -101,7 +422,7 @@ cores require a different kernel layout and are not used by this patch.
      }
      __syncthreads(); // P, row alpha and V are all ready for every PV warp.
  
-@@ -420,19 +441,20 @@
+@@ -420,19 +441,20 @@ void launch_partial(const at::Tensor &q, const at::Tensor &k,
        q.scalar_type() == at::kHalf && q.dim() == 3 && q.size(2) == kDim &&
            q.stride(2) == 1,
        "q must be FP16 [tokens, heads, 256] with last-dimension stride 1");
@@ -132,7 +453,7 @@ cores require a different kernel layout and are not used by this patch.
    if (quantized) {
      check_scale(*ks, k, q, "ks");
      check_scale(*vs, v, q, "vs");
-@@ -530,11 +552,131 @@
+@@ -530,7 +552,9 @@ void launch_partial(const at::Tensor &q, const at::Tensor &k,
    const dim3 grid(static_cast<unsigned int>(num_reqs * ntile),
                    static_cast<unsigned int>(kv_heads),
                    static_cast<unsigned int>(nseg));
@@ -143,10 +464,10 @@ cores require a different kernel layout and are not used by this patch.
      partial_kernel<true><<<grid, kThreads, 0, stream>>>(p);
    } else {
      partial_kernel<false><<<grid, kThreads, 0, stream>>>(p);
-   }
-+  C10_CUDA_KERNEL_LAUNCH_CHECK();
-+}
-+
+@@ -538,6 +562,124 @@ void launch_partial(const at::Tensor &q, const at::Tensor &k,
+   C10_CUDA_KERNEL_LAUNCH_CHECK();
+ }
+ 
 +// One warp owns a D256 vector. The butterfly is FP32, with the same
 +// low-to-high stage order as int4_per_token_head.fast_hadamard_transform.
 +// No shared memory, SM80 instructions, or per-token allocation is needed.
@@ -262,10 +583,13 @@ cores require a different kernel layout and are not used by this patch.
 +    }
 +  }
 +#undef RUN_RHT
-   C10_CUDA_KERNEL_LAUNCH_CHECK();
- }
++  C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
+ } // namespace
  
-@@ -545,8 +687,11 @@
+ TORCH_LIBRARY(qwen38_turing, m) {
+@@ -545,8 +687,11 @@ TORCH_LIBRARY(qwen38_turing, m) {
          "Tensor(b!) part_m, Tensor(c!) part_l, Tensor cuq, Tensor used_k, "
          "Tensor table, float scale, int num_reqs, int qmax, int qt, "
          "int ntile, int nseg, Tensor? ks=None, Tensor? vs=None) -> ()");
@@ -275,12 +599,13 @@ cores require a different kernel layout and are not used by this patch.
  
  TORCH_LIBRARY_IMPL(qwen38_turing, CUDA, m) {
    m.impl("partial", &launch_partial);
--}
 +  m.impl("rht", &launch_rht);
-+}
+ }
+diff --git a/v1/attention/ops/turing_spec_attn.py b/v1/attention/ops/turing_spec_attn.py
+index f50c28d..2c89a5d 100644
 --- a/v1/attention/ops/turing_spec_attn.py
 +++ b/v1/attention/ops/turing_spec_attn.py
-@@ -23,3 +23,9 @@
+@@ -23,3 +23,9 @@ def load_turing_partial():
          is_python_module=False,
      )
      return torch.ops.qwen38_turing.partial.default
@@ -290,313 +615,3 @@ cores require a different kernel layout and are not used by this patch.
 +def load_turing_rht():
 +    load_turing_partial()
 +    return torch.ops.qwen38_turing.rht.default
---- a/v1/attention/ops/spec_decode_attn.py
-+++ b/v1/attention/ops/spec_decode_attn.py
-@@ -173,8 +173,16 @@
- class SpecDecodeAttention:
-     """Holds the partial buffers; call .run(...) per layer."""
- 
--    def __init__(self, max_num_reqs, num_heads, head_dim, device, qmax,
--                 num_segments=None):
-+    def __init__(
-+        self,
-+        max_num_reqs,
-+        num_heads,
-+        head_dim,
-+        device,
-+        qmax,
-+        num_segments=None,
-+        packed_int4=False,
-+    ):
-         # The partial buffers are allocated once, for the longest query block the caller
-         # will ever pass (qmax): a CUDA graph captures their addresses, so growing them
-         # later would leave the captured decode graph pointing at freed memory.
-@@ -198,10 +206,25 @@
-         self.part_o = torch.empty(n, head_dim, dtype=torch.float32, device=device)
-         self.part_m = torch.empty(n, dtype=torch.float32, device=device)
-         self.part_l = torch.empty(n, dtype=torch.float32, device=device)
-+        self.packed_int4 = packed_int4
-+        if packed_int4:
-+            assert self.turing_partial is not None, "packed INT4 requires SM75 D256"
-+            from vllm.v1.attention.ops.int4_per_token_head import _get_rht_signs
-+            from vllm.v1.attention.ops.turing_spec_attn import load_turing_rht
-+
-+            self.rht = load_turing_rht()
-+            self.rht_signs = _get_rht_signs(head_dim, 0, device)
-+            shape = (max_num_reqs * qmax, num_heads, head_dim)
-+            self.rotated_query = torch.empty(shape, dtype=torch.float16, device=device)
-+            self.rotated_output = torch.empty(shape, dtype=torch.float32, device=device)
- 
-     def _plan(self, q_len, G, D):
-         """(BLOCK_M, tokens per tile, tile count, warps). One tile is preferred: every
-         extra tile re-reads this request's KV segment."""
-+        if self.packed_int4:
-+            assert 1 <= G <= 32
-+            qt = 32 // G
-+            return 32, qt, triton.cdiv(q_len, qt), 4
-         override = os.environ.get("VLLM_SPEC_ATTN_BLOCK_M")
-         rows = q_len * G
-         if override:
-@@ -223,13 +246,24 @@
-             num_reqs, max_query_len, k_scale_cache=None, v_scale_cache=None):
-         """key/value_cache: [num_blocks, block_size, Hkv, D] fp16/bf16, or
-         [.., D + pad] int8 with k/v_scale_cache [num_blocks, block_size, Hkv]
--        float32. Unquantized caches take no scale buffers."""
-+        float32. Packed UINT8 INT4 uses [.., D // 2 + pad] and the existing
-+        RHT/scale-bit format. Unquantized caches take no scale buffers."""
-         Hq, D = q.shape[1], q.shape[2]
-         Hkv = key_cache.shape[2]
-         G = Hq // Hkv
-         quant = k_scale_cache is not None
-         assert max_query_len <= self.qmax, "too many query tokens per request for this kernel"
-         assert num_reqs <= self.max_num_reqs
-+        assert (key_cache.dtype == torch.uint8) == self.packed_int4
-+        final_out = out
-+        if self.packed_int4:
-+            assert q.dtype == out.dtype == torch.float16
-+            assert q.shape[0] <= self.rotated_query.shape[0]
-+            rotated_query = self.rotated_query[: q.shape[0]]
-+            self.rht(q, rotated_query, self.rht_signs, False, cu_seqlens_q, num_reqs)
-+            q = rotated_query
-+            scale /= D
-+            out = self.rotated_output[: out.shape[0]]
-         # Turing has 64 KiB shared memory; Ampere's 99 KiB tile does not fit.
-         block_m, qt, ntile, warps = self._plan(max_query_len, G, D)
-         if (
-@@ -268,4 +302,6 @@
-             out.stride(0), out.stride(1),
-             Hq=Hq, QMAX=self.qmax, D=D, NSEG=self.nseg, num_warps=4,
-         )
--        return out
-+        if self.packed_int4:
-+            self.rht(out, final_out, self.rht_signs, True, cu_seqlens_q, num_reqs)
-+        return final_out
---- a/v1/attention/ops/turing_prefill_attn.py
-+++ b/v1/attention/ops/turing_prefill_attn.py
-@@ -15,11 +15,34 @@
- 
- @triton.jit
- def _gather_kv(
--    k, v, ks, vs, table, dst_k, dst_v, n,
--    kb, kt, kh, kd, vb, vt, vh, vd,
--    ksb, kst, ksh, vsb, vst, vsh,
--    capacity: tl.constexpr, D: tl.constexpr, BLOCK: tl.constexpr,
--    QUANT: tl.constexpr, ROWS: tl.constexpr,
-+    k,
-+    v,
-+    ks,
-+    vs,
-+    table,
-+    dst_k,
-+    dst_v,
-+    n,
-+    kb,
-+    kt,
-+    kh,
-+    kd,
-+    vb,
-+    vt,
-+    vh,
-+    vd,
-+    ksb,
-+    kst,
-+    ksh,
-+    vsb,
-+    vst,
-+    vsh,
-+    capacity: tl.constexpr,
-+    D: tl.constexpr,
-+    BLOCK: tl.constexpr,
-+    QUANT: tl.constexpr,
-+    PACKED: tl.constexpr,
-+    ROWS: tl.constexpr,
- ):
-     head = tl.program_id(1)
-     pos = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
-@@ -27,13 +50,38 @@
-     valid = pos < n
-     block = tl.load(table + pos // BLOCK, mask=valid, other=0)
-     slot = pos % BLOCK
--    kval = tl.load(k + block[:, None] * kb + slot[:, None] * kt
--                   + head * kh + dim[None, :] * kd, mask=valid[:, None], other=0)
--    vval = tl.load(v + block[:, None] * vb + slot[:, None] * vt
--                   + head * vh + dim[None, :] * vd, mask=valid[:, None], other=0)
-+    cache_dim = dim // 2 if PACKED else dim
-+    kval = tl.load(
-+        k
-+        + block[:, None] * kb
-+        + slot[:, None] * kt
-+        + head * kh
-+        + cache_dim[None, :] * kd,
-+        mask=valid[:, None],
-+        other=0,
-+    )
-+    vval = tl.load(
-+        v
-+        + block[:, None] * vb
-+        + slot[:, None] * vt
-+        + head * vh
-+        + cache_dim[None, :] * vd,
-+        mask=valid[:, None],
-+        other=0,
-+    )
-     if QUANT:
-         kscale = tl.load(ks + block * ksb + slot * kst + head * ksh, mask=valid, other=0)
-         vscale = tl.load(vs + block * vsb + slot * vst + head * vsh, mask=valid, other=0)
-+        if PACKED:
-+            kbits = kscale.to(tl.int32, bitcast=True)
-+            vbits = vscale.to(tl.int32, bitcast=True)
-+            kzero = kbits & 15
-+            vzero = vbits & 15
-+            kscale = (kbits & -16).to(tl.float32, bitcast=True)
-+            vscale = (vbits & -16).to(tl.float32, bitcast=True)
-+            shift = (dim[None, :] & 1) * 4
-+            kval = ((kval.to(tl.int32) >> shift) & 15) - kzero[:, None]
-+            vval = ((vval.to(tl.int32) >> shift) & 15) - vzero[:, None]
-         kval = kval.to(tl.float32) * kscale[:, None]
-         vval = vval.to(tl.float32) * vscale[:, None]
-     offset = (head * capacity + pos[:, None]) * D + dim[None, :]
-@@ -60,15 +108,44 @@
-         assert q.dtype == out.dtype == torch.float16
-         quant = k_scale_cache is not None
-         assert (v_scale_cache is not None) == quant
--        assert k.dtype == v.dtype == (torch.int8 if quant else torch.float16)
-+        packed = k.dtype == torch.uint8
-+        assert (
-+            k.dtype
-+            == v.dtype
-+            == (torch.uint8 if packed else torch.int8 if quant else torch.float16)
-+        )
-+        assert not packed or (quant and dim == 256)
-+        if packed:
-+            from vllm.v1.attention.ops.int4_per_token_head import _get_rht_signs
-+            from vllm.v1.attention.ops.turing_spec_attn import load_turing_rht
-+
-+            rht = load_turing_rht()
-+            signs = _get_rht_signs(dim, 0, q.device)
-+            # The caller's output doubles as rotated Q until SDPA returns.
-+            rht(q, out, signs, False)
-+            q = out
-+            scale /= dim
-         _gather_kv[(triton.cdiv(num_keys, 16), self.num_kv_heads)](
--            k, v, k_scale_cache, v_scale_cache, block_table,
--            self.key, self.value, num_keys,
--            *k.stride(), *v.stride(),
-+            k,
-+            v,
-+            k_scale_cache,
-+            v_scale_cache,
-+            block_table,
-+            self.key,
-+            self.value,
-+            num_keys,
-+            *k.stride(),
-+            *v.stride(),
-             *(k_scale_cache.stride() if quant else (0, 0, 0)),
-             *(v_scale_cache.stride() if quant else (0, 0, 0)),
--            capacity=self.capacity, D=dim, BLOCK=k.shape[1], QUANT=quant,
--            ROWS=16, num_warps=4, num_stages=1,
-+            capacity=self.capacity,
-+            D=dim,
-+            BLOCK=k.shape[1],
-+            QUANT=quant,
-+            PACKED=packed,
-+            ROWS=16,
-+            num_warps=4,
-+            num_stages=1,
-         )
-         group = num_heads // self.num_kv_heads
-         shape = (num_queries, num_keys, num_heads)
-@@ -87,6 +164,8 @@
-         # Cutlass returns grouped BSHD storage. Copy straight into the caller's
-         # output view; do not materialize a second transposed intermediate.
-         out.view(num_queries, self.num_kv_heads, group, dim).permute(1, 2, 0, 3).copy_(result)
-+        if packed:
-+            rht(out, out, signs, True)
-         return out
- 
- 
---- a/v1/attention/backends/triton_attn.py
-+++ b/v1/attention/backends/triton_attn.py
-@@ -804,7 +804,12 @@
-             and current_platform.is_device_capability(75)
-             and vllm_config.model_config.dtype == torch.float16
-             and head_size == 256
--            and self._kv_quant_mode in (KVQuantMode.NONE, KVQuantMode.INT8_PER_TOKEN_HEAD)
-+            and self._kv_quant_mode
-+            in (
-+                KVQuantMode.NONE,
-+                KVQuantMode.INT8_PER_TOKEN_HEAD,
-+                KVQuantMode.INT4_PER_TOKEN_HEAD,
-+            )
-             and attn_type == AttentionType.DECODER
-             and self.sliding_window == (-1, -1)
-             and not self.logits_soft_cap
-@@ -940,14 +945,24 @@
- 
-         mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
- 
-+        native_int4 = (
-+            self._kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD
-+            and current_platform.is_cuda()
-+            and current_platform.is_device_capability(75)
-+            and query.dtype == torch.float16
-+            and self.head_size == 256
-+            and 1 <= self.num_heads // self.num_kv_heads <= 32
-+            and k_scale_cache is not None
-+            and v_scale_cache is not None
-+        )
-         # syv patch: the split-KV Triton verify attention (patches/spec-decode-attn.patch),
-         # which vLLM's own unified attention cannot do here -- it refuses to split the KV
-         # sequence whenever max_seqlen_q > 1 (triton_unified_attention.py, `use_3d`), and
-         # every DFlash2 step is a multi-query verify. Measured at a 128k context, 8 query
-         # tokens: 1.3 ms per layer against unified attention's 7.4 ms.
--        # FP16 unquantized KV and int8 per-token-head KV: for int8 the kernel folds
--        # the per-(token, head) scales in after each dot because they are constant
--        # along the head dim. Other unquantized dtypes keep their existing path.
-+        # FP16 and INT8 retain their existing path. Native SM75 INT4 also
-+        # handles single-token decode: tiles unpack centered nibbles, while
-+        # query/output RHT uses graph-stable scratch, never a full KV unpack.
-         # The drafter's own sliding-window layers are excluded below.
-         if (
-             _spec_attn_enabled()
-@@ -964,12 +979,14 @@
-                     and key_cache.dtype == torch.float16
-                     and value_cache.dtype == torch.float16
-                 )
-+                or native_int4
-             )
-             and 16 <= self.head_size <= 256
-             and self.head_size & (self.head_size - 1) == 0
-             and self.num_heads % self.num_kv_heads == 0
-             and key_cache.shape[1] % 16 == 0
--            and 1 < max_seqlen_q <= _spec_attn_qmax(self.num_heads // self.num_kv_heads)
-+            and (1 <= max_seqlen_q if native_int4 else 1 < max_seqlen_q)
-+            and max_seqlen_q <= _spec_attn_qmax(self.num_heads // self.num_kv_heads)
-             and attn_metadata.causal
-             and (self.sliding_window is None or self.sliding_window == (-1, -1))
-             and not self.logits_soft_cap
---- a/v1/attention/backends/flash_attn.py
-+++ b/v1/attention/backends/flash_attn.py
-@@ -1914,12 +1914,19 @@
-     # scheduler's capacity from model construction, not a guessed 256 requests.
-     num_reqs = cu_seqlens_q.shape[0] - 1
-     max_reqs = max(impl._spec_attn_max_reqs or num_reqs, num_reqs)
--    key = (impl.num_heads, impl.head_size, q.device, max_reqs)
-+    packed_int4 = (
-+        key_cache.dtype == torch.uint8 and impl.kv_cache_dtype == "int4_per_token_head"
-+    )
-+    key = (impl.num_heads, impl.head_size, q.device, max_reqs, packed_int4)
-     att = _SPEC_ATTN.get(key)
-     if att is None:
-         att = SpecDecodeAttention(
--            max_reqs, impl.num_heads, impl.head_size, q.device,
-+            max_reqs,
-+            impl.num_heads,
-+            impl.head_size,
-+            q.device,
-             qmax=_spec_attn_qmax(impl.num_heads // impl.num_kv_heads),
-+            packed_int4=packed_int4,
-         )
-         _SPEC_ATTN[key] = att
-     att.run(q, key_cache, value_cache, out, cu_seqlens_q, seqused_k, block_table, impl.scale,

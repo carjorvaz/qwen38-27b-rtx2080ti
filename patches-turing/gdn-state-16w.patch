@@ -12,6 +12,8 @@ measured 5.67 -> 1.98 ms per 2048-token chunk per layer (3.1x) with one CTA
 per SM and no spills (103 registers at 8 warps, under the 128-register cap
 for 512 threads).
 
+diff --git a/third_party/flash_linear_attention/ops/turing_gdn.cu b/third_party/flash_linear_attention/ops/turing_gdn.cu
+index 29af902..0bbe63e 100644
 --- a/third_party/flash_linear_attention/ops/turing_gdn.cu
 +++ b/third_party/flash_linear_attention/ops/turing_gdn.cu
 @@ -12,7 +12,7 @@
@@ -23,7 +25,7 @@ for 512 threads).
  constexpr int BS = D + 8, VS = VT + 8, FS = D + 4, PS = VT + 4;
  using Acc = wmma::fragment<wmma::accumulator, 16, 16, 16, float>;
  using AR = wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major>;
-@@ -52,7 +52,7 @@
+@@ -52,7 +52,7 @@ __global__ void state_kernel(Params p) {
                               : static_cast<const int32_t *>(p.offsets)[seq];
    const int chunks = (length + BT - 1) / BT;
    const int warp = threadIdx.x / 32, tid = threadIdx.x;
@@ -32,7 +34,7 @@ for 512 threads).
    for (int x = tid; x < VT * D; x += THREADS) {
      const int v = x / D, k = x % D;
      const int64_t off = seq * p.ht + head * p.hh + (value_start + v) * p.hv + k;
-@@ -64,9 +64,9 @@
+@@ -64,9 +64,9 @@ __global__ void state_kernel(Params p) {
    }
    __syncthreads();
  #pragma unroll
@@ -45,7 +47,7 @@ for 512 threads).
                             wmma::mem_row_major);
    }
    for (int chunk = 0; chunk < chunks; ++chunk) {
-@@ -74,9 +74,9 @@
+@@ -74,9 +74,9 @@ __global__ void state_kernel(Params p) {
      // Keep FP32 state in registers; publish its FP16 pre-chunk snapshot.
      __syncthreads();
  #pragma unroll
@@ -58,7 +60,7 @@ for 512 threads).
                                wmma::mem_row_major);
      }
      __syncthreads();
-@@ -95,20 +95,20 @@
+@@ -95,20 +95,20 @@ __global__ void state_kernel(Params p) {
                                : __float2half_rn(0.f);
      }
      __syncthreads();
@@ -86,7 +88,7 @@ for 512 threads).
                                PS, wmma::mem_row_major);
      }
      __syncthreads();
-@@ -138,28 +138,28 @@
+@@ -138,28 +138,28 @@ __global__ void state_kernel(Params p) {
      __syncthreads();
      const float decay = expf(g_last);
  #pragma unroll

@@ -7,9 +7,38 @@ not change Q/K/V, MLP gate/up, convolution or selector weights. Layer
 subclasses with their own initialization keep their original range, and the
 embedding table stays shared with the target after loading.
 
+diff --git a/model_executor/layers/vocab_parallel_embedding.py b/model_executor/layers/vocab_parallel_embedding.py
+index 70c6516..37c6f0a 100644
+--- a/model_executor/layers/vocab_parallel_embedding.py
++++ b/model_executor/layers/vocab_parallel_embedding.py
+@@ -498,7 +498,21 @@ class VocabParallelEmbedding(PluggableLayer):
+ 
+     def forward(self, input_):
+         if self.tp_size == 1:
+-            return self.quant_method.embedding(self, input_.long())
++            # Speculative verification pads unused slots with -1 even at TP=1.
++            # Mask before all embedding methods, including quantized gathers.
++            input_mask = (input_ < 0) | (input_ >= self.num_embeddings_per_partition)
++            masked_input = input_.masked_fill(input_mask, 0)
++            output_parallel = self.quant_method.embedding(self, masked_input.long())
++            if output_parallel.dtype in (
++                torch.float8_e4m3fn,
++                torch.float8_e5m2,
++            ):
++                output_parallel.view(torch.int8).masked_fill_(
++                    input_mask.unsqueeze(-1), 0
++                )
++            else:
++                output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
++            return output_parallel
+ 
+         if self.use_fused_embedding:
+             output_parallel = ops.vocab_parallel_embedding(
+diff --git a/model_executor/models/qwen3_dflash.py b/model_executor/models/qwen3_dflash.py
+index d38adfc..a6ff712 100644
 --- a/model_executor/models/qwen3_dflash.py
 +++ b/model_executor/models/qwen3_dflash.py
-@@ -409,6 +409,8 @@
+@@ -389,6 +389,8 @@ def _dense_kv_rows(attn: nn.Module) -> torch.Tensor:
  @support_torch_compile
  class DFlashQwen3Model(nn.Module):
      decoder_layer_cls = DFlashQwen3DecoderLayer
@@ -18,7 +47,7 @@ embedding table stays shared with the target after loading.
  
      hf_to_vllm_mapper = WeightsMapper(
          orig_to_new_substr={
-@@ -439,6 +441,14 @@
+@@ -419,6 +421,14 @@ class DFlashQwen3Model(nn.Module):
          self.config = vllm_config.speculative_config.draft_model_config.hf_config
          self.vocab_size = self.config.vocab_size
          self.quant_config = get_draft_quant_config(vllm_config)
@@ -33,7 +62,7 @@ embedding table stays shared with the target after loading.
  
          drafter_config = getattr(self.config, "eagle_config", {})
          drafter_config.update(getattr(self.config, "dflash_config", {}))
-@@ -501,6 +511,17 @@
+@@ -483,6 +493,17 @@ class DFlashQwen3Model(nn.Module):
              self.config.hidden_size,
              eps=self.config.rms_norm_eps,
          )
@@ -51,7 +80,7 @@ embedding table stays shared with the target after loading.
  
      def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
          embeds = self.embed_tokens(input_ids)
-@@ -508,6 +529,10 @@
+@@ -490,6 +511,10 @@ class DFlashQwen3Model(nn.Module):
              # Replace masked slots with the dedicated mask embedding.
              is_mask = (input_ids == self.mask_token_id).unsqueeze(-1)
              embeds = torch.where(is_mask, self.mask_embedding.to(embeds.dtype), embeds)
@@ -62,7 +91,7 @@ embedding table stays shared with the target after loading.
          return embeds
  
      def _build_context_kv_buffers(
-@@ -516,6 +541,7 @@
+@@ -498,6 +523,7 @@ class DFlashQwen3Model(nn.Module):
          has_bias: bool,
      ) -> None:
          self._hidden_norm_weight = self.hidden_norm.weight.data
@@ -70,7 +99,7 @@ embedding table stays shared with the target after loading.
  
          # KV projection weights: [num_layers * 2 * kv_size, hidden_size]
          kv_weights = [_dense_kv_rows(a) for a in layers_attn]
-@@ -562,14 +588,16 @@
+@@ -544,14 +570,16 @@ class DFlashQwen3Model(nn.Module):
          self._kv_size = attn0.kv_size
          self._head_dim = attn0.head_dim
          self._num_kv_heads = attn0.num_kv_heads
@@ -89,7 +118,7 @@ embedding table stays shared with the target after loading.
              ), "All layers must have the same attn config for DFlash precomputation"
  
          # References to inner Attention layers for direct cache writes
-@@ -589,7 +617,7 @@
+@@ -571,7 +599,7 @@ class DFlashQwen3Model(nn.Module):
              normed_context_states,
              context_states,
              self._hidden_norm_weight,
@@ -98,7 +127,7 @@ embedding table stays shared with the target after loading.
          )
          all_kv_flat = F.linear(
              normed_context_states, self._fused_kv_weight, self._fused_kv_bias
-@@ -718,6 +746,35 @@
+@@ -700,6 +728,35 @@ class DFlashQwen3Model(nn.Module):
          tp_size = get_tensor_model_parallel_world_size()
          tp_rank = get_tensor_model_parallel_rank()
          for name, loaded_weight in weights:
@@ -134,7 +163,7 @@ embedding table stays shared with the target after loading.
              if "attention_sink_bias" in name:
                  # Sink bias is per-head; shard it across TP ranks like the
                  # attention heads themselves.
-@@ -730,7 +787,7 @@
+@@ -712,7 +769,7 @@ class DFlashQwen3Model(nn.Module):
      def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
          loader = AutoWeightsLoader(self)
          return loader.load_weights(
@@ -143,23 +172,3 @@ embedding table stays shared with the target after loading.
          )
  
  
---- a/model_executor/layers/vocab_parallel_embedding.py
-+++ b/model_executor/layers/vocab_parallel_embedding.py
-@@ -496,12 +496,15 @@
-                 self.shard_indices.added_vocab_end_index,
-             )
-         else:
--            masked_input = input_
-+            # Speculative verification pads unused slots with -1 even at TP=1.
-+            # Mask before all embedding methods, including quantized gathers.
-+            input_mask = (input_ < 0) | (input_ >= self.num_embeddings_per_partition)
-+            masked_input = input_.masked_fill(input_mask, 0)
-         # Get the embeddings.
-         output_parallel = self.quant_method.embedding(self, masked_input.long())
-         # Mask the output embedding.
-+        output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
-         if self.tp_size > 1:
--            output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
-             # Reduce across all the model parallel GPUs.
-             return tensor_model_parallel_all_reduce(output_parallel)
-         return output_parallel

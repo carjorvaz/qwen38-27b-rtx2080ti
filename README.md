@@ -1,7 +1,7 @@
 # Qwen3.8-27B on a 22 GB RTX 2080 Ti
 
 A fork of [syv-ai/HyperQwen](https://github.com/syv-ai/HyperQwen) that ports its
-vLLM 0.28.0 serving stack to Turing (SM75). One RTX 2080 Ti with 22 GB runs
+vLLM 0.29.0 serving stack to Turing (SM75). One RTX 2080 Ti with 22 GB runs
 Qwen3.8-27B at 262,144 tokens of context out of a 5.5 GiB int4 KV pool, with
 MTP speculative decoding, prefix caching and an int8 prefill path.
 
@@ -31,16 +31,19 @@ From an empty cache, 32k took 31.9 s (1,027 tok/s) and 253k took 625 s
 Quality with the int4 KV cache: 10.88 PPL on wikitext-2 and 94.5% on GSM8K
 (200 questions).
 
-`patches-turing/` is the port, applied after upstream's `patches/`. Each patch
-carries its own measurements in its header. The series-wide numbers, including
-what was measured and rejected, are in [docs/turing-2080ti.md](docs/turing-2080ti.md).
-The optional prefill work, including bounded KV staging and transient int8
-GEMMs, is in [docs/turing-prefill.md](docs/turing-prefill.md).
+`patches-turing/` is the port, applied after upstream's `patches/series`. Each
+patch carries its own measurements in its header; the numbers above are still
+vLLM 0.28.0 measurements, and the 0.29.0 rebase and what it retires are in
+[docs/turing-0.29-port.md](docs/turing-0.29-port.md). The series-wide numbers,
+including what was measured and rejected, are in
+[docs/turing-2080ti.md](docs/turing-2080ti.md). The optional prefill work,
+including bounded KV staging and transient int8 GEMMs, is in
+[docs/turing-prefill.md](docs/turing-prefill.md).
 
 ## Running it
 
-Apply `patches/` and then `patches-turing/` in `patches-turing/series` order to
-a vLLM 0.28.0 checkout, then:
+Apply `patches/series` and then `patches-turing/series` to a vLLM 0.29.0
+checkout, both at `--fuzz 0` (`patches-turing/README.md` has the loop), then:
 
 ```bash
 vllm serve models/Qwen3.8-27B-W4A16-AutoRound \
