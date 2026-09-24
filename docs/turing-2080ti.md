@@ -4,9 +4,10 @@ This branch adds a Turing port to the 3090 stack. `patches-turing/` is a
 21-patch series applied after upstream's `patches/series`, on the same
 vLLM 0.29.0 pin, and it runs the same serving setup on a card that is 8 GB
 smaller and one generation older: an RTX 2080 Ti with 22 GB, running at 280 W
-(the card's factory cap is 250 W). The 0.29.0 rebase is recorded in
-[turing-0.29-port.md](turing-0.29-port.md); the numbers below are still the
-vLLM 0.28.0 measurements.
+(the card's factory cap is 250 W). The 0.29.0 rebase and its validation are
+recorded in [turing-0.29-port.md](turing-0.29-port.md): quality is unchanged on
+0.29.0 (PPL 10.88, GSM8K 95.5%) and decode is equal or better; the per-context
+tables below remain the 0.28.0 measurements.
 
 The short version: 262,144 tokens of context out of a 5.5 GiB int4 KV pool,
 112 tok/s single-stream decode at 2k and 66 tok/s at 128k, with MTP speculation
@@ -96,6 +97,9 @@ vllm serve models/Qwen3.8-27B-W4A16-AutoRound \
 
 `--kv-cache-memory 5905580032` is the whole budget the card has for KV at this
 context: raise it for a longer context, lower it if the model does not load.
+On vLLM 0.29.0, also set `VLLM_USE_V2_MODEL_RUNNER=0`: the MTP history lookup
+lives in the V1 proposer, and the 0.29 default (V2) silently drops it (prose is
+at parity between the two, copy/edit is ~3% ahead on V1).
 `--load-format runai_streamer` with `--model-loader-extra-config
 '{"concurrency":2,"memory_limit":1610612736}'` is worth adding on a host with
 little RAM; it made the difference between a clean load and an OOM kill on an

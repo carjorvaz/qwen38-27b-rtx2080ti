@@ -77,22 +77,44 @@ series before this fix, including the 0.28.0 one.
 
 ## What is verified
 
-- `patches-turing/check_vllm_series.sh` against a pristine v0.29.0 clone:
-  upstream's checker is green (44 patches, plus the `git apply` DFlash pass),
-  and the Turing series then applies in order with exact context — 21 patches,
-  0 offsets, 0 fuzz.
-- The regenerated series replays to a tree byte-identical to the per-patch port
-  tree (verified by applying the patch files to a clean base and diffing
-  against the rebased tree).
-- Every changed Python file compiles.
+**Patch mechanics.** `patches-turing/check_vllm_series.sh` against a pristine
+v0.29.0 clone: upstream's checker is green (44 patches plus the `git apply`
+DFlash pass), the Turing series then applies in order with exact context (21
+patches, 0 offsets, 0 fuzz), and the regenerated series replays to a tree
+byte-identical to the per-patch port tree. Every changed Python file compiles.
 
-## What is not verified
+**On the card (tiberius, RTX 2080 Ti).** The port was installed into the pinned
+runtime and run as production:
 
-No GPU ran during the port. The native kernels, the boot path, and every
-number in [turing-2080ti.md](turing-2080ti.md) and
-[turing-prefill.md](turing-prefill.md) are still vLLM 0.28.0 measurements; the
-0.29.0 tree has not served a request here. The first thing to run on the card is
-the no-model kernel set — `python bench/test_turing_prefill.py`,
-`bench/test_turing_marlin.py`, `bench/test_turing_gdn.py` — then the launching
-line in [Running it](turing-2080ti.md#running-it) and the quality battery, and
-then the tables need re-measuring and re-labelling.
+- Kernel suites: `test_turing_gdn.py`, `test_turing_prefill.py` (94/94
+  comparisons after the running-max fix) and `test_turing_marlin.py` PASS.
+- The deployment's packaged regressions — `qwen38-sm75-check attention|prefill|
+  prefix|gdn|downloads` — all PASS, including 262144-token prefill, same-address
+  graph replay and the packed-int4 oracle.
+- Quality, same harness as the 0.28 numbers, greedy: PPL **10.8818** (en
+  10.8096, da 10.9401; 25,092 tokens) against 10.8797 on 0.28.0, and GSM8K
+  **95.5%** (n=200) against 94.5%. The optional uncensored checkpoint on the
+  same runtime: PPL **10.9337** against 10.94 and GSM8K **97.5%** against 96.5%.
+- Runner: 0.29.0 defaults to the V2 model runner. Same-session V1 against V2 on
+  realistic text at identical acceptance is parity (33.9/34.3/37.8/43.5 ms
+  against 34.1/34.9/37.9/43.1 ms at 2k/8k/32k/64k) and the production bench is
+  equal or better at every depth than the 0.28 table. The Turing MTP history
+  lookup exists only in the V1 proposer, so the deployment pins V1
+  (`VLLM_USE_V2_MODEL_RUNNER=0`) to keep it; on copy-shaped traffic V1+lookup
+  measured 96.3/101.5 tok/s against V2's 93.8/98.0.
+
+A record of the raw-completion API bench (`bench/turing_api_bench.py
+--corpus wikitext`) on 0.29.0 V1: 88.6 / 107.7 / 78.9 / 83.2 / 59.0 tok/s at
+2k / 8k / 32k / 64k / 128k. Those numbers are prompt-sensitive — acceptance
+moves with the exact slice and with chat- versus raw-completion prompt form —
+so they are a record, not a like-for-like replacement for the 0.28.0 table.
+
+## Open items
+
+- The lookup is not ported to the V2 `MTPSpeculator`; V1 is pinned instead
+  (parity on prose, ahead on copy).
+- Upstream's confidence-scored adaptive verification is DSpark-only and the
+  single spec-stride cudagraph assumption is unchanged, so the fork's adaptive
+  verify block keeps its 0.28 verdict (it loses ~4%); see the ops exec plan.
+- The 2080 Ti tables in [turing-2080ti.md](turing-2080ti.md) are still the
+  0.28.0 runs; a like-for-like repaint needs the original prompt set pinned.

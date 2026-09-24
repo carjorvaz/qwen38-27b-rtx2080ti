@@ -32,8 +32,11 @@ Quality with the int4 KV cache: 10.88 PPL on wikitext-2 and 94.5% on GSM8K
 (200 questions).
 
 `patches-turing/` is the port, applied after upstream's `patches/series`. Each
-patch carries its own measurements in its header; the numbers above are still
-vLLM 0.28.0 measurements, and the 0.29.0 rebase and what it retires are in
+patch carries its own measurements in its header. The port was re-validated on
+vLLM 0.29.0 on the card: quality is unchanged (PPL 10.88, GSM8K 95.5%) and
+decode is equal or better on the deployment's bench, so the per-context numbers
+above remain the 0.28.0 run. The 0.29.0 rebase, the four retirements and the
+full validation record are in
 [docs/turing-0.29-port.md](docs/turing-0.29-port.md). The series-wide numbers,
 including what was measured and rejected, are in
 [docs/turing-2080ti.md](docs/turing-2080ti.md). The optional prefill work,
