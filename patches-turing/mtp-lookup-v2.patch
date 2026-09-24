@@ -1,0 +1,236 @@
+MTP history lookup on the V2 model runner.
+
+The lookup shipped first in the V1 proposer (`mtp-history-lookup.patch`,
+`VLLM_MTP_LOOKUP`). vLLM 0.29 defaults to the V2 runner, whose MTP speculator
+proposes its own block; this adds the same feature there, matching against the
+runner's `all_token_ids` history, which is current at propose() time. The same
+gate applies (the step that just finished accepted every draft it was given,
+the previous match was long enough, and this match can fill the whole block),
+all decided on device with no host synchronization; an overridden request's
+draft distribution becomes a point mass on the proposed token, which is a legal
+q for rejection sampling, so the output distribution is unchanged. Greedy only
+unless `VLLM_MTP_LOOKUP_SAMPLED=1`, like V1, and disabled when the draft
+vocabulary is not the target vocabulary (the lookup proposes target ids).
+
+Measured on the 2080 Ti, V2 runner, k=4, 32k-word verbatim copy, 512 output
+tokens: acceptance 4.19-4.22 and 107.1-107.9 tok/s against the V2 baseline's
+3.66-3.84 and 93.8-98.0, and V1+lookup's 3.73-3.93 and 96.3-101.5. Prose is at
+parity (8k acceptance 3.969, 117.7/113.5 tok/s; 32k 3.97, 101.9), sampled
+traffic is untouched (the lookup is gated off), and GSM8K n=100 reads 94.0%
+against the deployed stack's 94.5% (n=200).
+
+diff --git a/v1/worker/gpu/spec_decode/autoregressive/speculator.py b/v1/worker/gpu/spec_decode/autoregressive/speculator.py
+--- a/v1/worker/gpu/spec_decode/autoregressive/speculator.py
++++ b/v1/worker/gpu/spec_decode/autoregressive/speculator.py
+@@ -5,6 +5,7 @@
+ import torch
+ import torch.nn as nn
+ 
++import vllm.envs as envs
+ from vllm.config import VllmConfig
+ from vllm.config.compilation import CUDAGraphMode
+ from vllm.forward_context import BatchDescriptor, set_forward_context
+@@ -47,6 +48,42 @@
+         self.decode_cudagraph_manager: SpeculatorCudaGraphManager | None = None
+         self.use_fused_multi_step_decode = False
+ 
++        # Turing port: MTP history lookup (VLLM_MTP_LOOKUP). The same feature
++        # lives in the V1 proposer (v1/spec_decode/llm_base_proposer.py); this
++        # is the V2 implementation, matching against the runner's own token
++        # history. See _apply_mtp_lookup.
++        self._req_states = None
++        self._lookup_enabled = envs.VLLM_MTP_LOOKUP
++        self._lookup_min = envs.VLLM_MTP_LOOKUP_MIN
++        self._lookup_sample = envs.VLLM_MTP_LOOKUP_SAMPLED
++        self._lookup_nmin = envs.VLLM_MTP_LOOKUP_NMIN
++        self._lookup_nmax = envs.VLLM_MTP_LOOKUP_NMAX
++        self._lookup_search = envs.VLLM_MTP_LOOKUP_SEARCH
++        self._lookup_tokens = torch.zeros(
++            (self.max_num_reqs, self.num_speculative_steps),
++            dtype=torch.int32,
++            device=device,
++        )
++        self._lookup_len = torch.zeros(
++            self.max_num_reqs, dtype=torch.int32, device=device
++        )
++        self._lookup_valid = torch.zeros(
++            self.max_num_reqs, dtype=torch.int32, device=device
++        )
++        self._lookup_prev_ok = torch.zeros(
++            self.max_num_reqs, dtype=torch.int32, device=device
++        )
++        if self._lookup_enabled and self.vocab_size != vllm_config.model_config.get_vocab_size():
++            # The lookup proposes target token ids; a drafter with a reduced
++            # vocabulary would index its proposal distribution out of range.
++            logger.warning_once(
++                "VLLM_MTP_LOOKUP disabled: the draft vocabulary (%d) is not the "
++                "target vocabulary (%d).",
++                self.vocab_size,
++                vllm_config.model_config.get_vocab_size(),
++            )
++            self._lookup_enabled = False
++
+     def load_model(self, target_model: nn.Module) -> None:
+         super().load_model(target_model)
+         if not self.supports_mm_inputs:
+@@ -320,6 +357,9 @@
+             )
+         self.on_prefill_end(num_reqs)
+ 
++        if not (dummy_run or is_profile):
++            self._apply_mtp_lookup(num_reqs, num_sampled, num_rejected)
++
+         if self.num_speculative_steps == 1:
+             # Early exit.
+             return self.draft_tokens[:num_reqs, :1]
+@@ -369,8 +409,100 @@
+         )
+         self.on_multi_step_decode_end(num_reqs)
+ 
++        if not (dummy_run or is_profile):
++            self._apply_mtp_lookup(num_reqs, num_sampled, num_rejected)
++
+         return self.draft_tokens[:num_reqs]
+ 
++    def set_req_states(self, req_states) -> None:
++        """The token history the MTP lookup matches against (set by the runner)."""
++        self._req_states = req_states
++
++    def _apply_mtp_lookup(
++        self,
++        num_reqs: int,
++        num_sampled: torch.Tensor,
++        num_rejected: torch.Tensor,
++    ) -> None:
++        """Propose the draft block from the request's own history (VLLM_MTP_LOOKUP).
++
++        A request that is reproducing its prompt (quoting a document, applying an
++        edit) has its continuation already in the token history. V2 keeps that
++        history in `req_states.all_token_ids`, current at propose() time, so the
++        lookup runs directly against it; V1 builds the same thing in the proposer.
++
++        An override is taken only when the step that just finished accepted every
++        token it was given (evidence that a copy is running), the previous step's
++        match was long enough, and this step's match can fill the whole block.
++        Everything is decided on device, so there is no host synchronization. The
++        draft distribution for an overridden request becomes a point mass on the
++        proposed token, which is a legal q for rejection sampling, so the output
++        distribution is unchanged.
++        """
++        if not self._lookup_enabled or self.method != "mtp" or self._req_states is None:
++            return
++        k = self.num_speculative_steps
++        if k < 1 or num_reqs <= 0:
++            return
++        logger.info_once(
++            "MTP history lookup on (V2): min=%d nmin=%d nmax=%d k=%d",
++            self._lookup_min,
++            self._lookup_nmin,
++            self._lookup_nmax,
++            k,
++        )
++        from vllm.v1.worker.gpu.spec_decode.dflash2.lookup import suffix_lookup
++
++        _, match_len, valid = suffix_lookup(
++            self._req_states.all_token_ids.gpu,
++            self._req_states.total_len.gpu,
++            self.idx_mapping,
++            num_reqs,
++            k=k,
++            nmax=self._lookup_nmax,
++            nmin=self._lookup_nmin,
++            search_max=self._lookup_search,
++            min_tail=k,
++            out_tokens=self._lookup_tokens[:num_reqs],
++            out_len=self._lookup_len[:num_reqs],
++            out_valid=self._lookup_valid[:num_reqs],
++        )
++        current_ok = (valid[:num_reqs] >= k) & (
++            match_len[:num_reqs] >= self._lookup_min
++        )
++        if self._lookup_sample:
++            sampled_ok = torch.ones(
++                num_reqs, dtype=torch.bool, device=self.device
++            )
++        else:
++            # Greedy only by default: a point-mass proposal is a weaker draft
++            # than the drafter's own distribution wherever the drafter is right.
++            sampled_ok = self.temperature[:num_reqs] == 0
++        use = (
++            current_ok
++            & sampled_ok
++            & (self._lookup_prev_ok[:num_reqs] != 0)
++            & (num_sampled[:num_reqs] >= k + 1)
++            & (num_rejected[:num_reqs] == 0)
++        ).to(torch.int32)
++        self._lookup_prev_ok[:num_reqs].copy_(current_ok.to(torch.int32))
++        has_logits = self.draft_logits is not None
++        _mtp_lookup_apply_kernel[(num_reqs * k,)](
++            self.draft_tokens,
++            self.draft_tokens.stride(0),
++            self.draft_logits,
++            self.draft_logits.stride(0) if has_logits else 0,
++            self.draft_logits.stride(1) if has_logits else 0,
++            self._lookup_tokens,
++            self._lookup_tokens.stride(0),
++            use,
++            self.idx_mapping,
++            self.draft_logits.shape[2] if has_logits else 0,
++            k=k,
++            HAS_LOGITS=has_logits,
++            BLOCK_V=1024,
++            num_warps=4,
++        )
+     @torch.inference_mode()
+     def _run_model(
+         self,
+@@ -665,6 +797,49 @@
+ 
+ 
+ @triton.jit
++def _mtp_lookup_apply_kernel(
++    draft_tokens_ptr,
++    draft_tokens_stride,
++    draft_logits_ptr,
++    draft_logits_stride_0,
++    draft_logits_stride_1,
++    lookup_tokens_ptr,
++    lookup_tokens_stride,
++    use_ptr,
++    idx_mapping_ptr,
++    vocab_size,
++    k: tl.constexpr,
++    HAS_LOGITS: tl.constexpr,
++    BLOCK_V: tl.constexpr,
++):
++    """Write the lookup's proposal where the gate selected it, and make the draft
++    distribution a point mass on that token (a legal q for rejection sampling).
++    The row is rewritten in full because the rejection sampler softmaxes it."""
++    flat = tl.program_id(0)
++    req = flat // k
++    step = flat % k
++    if tl.load(use_ptr + req) == 0:
++        return
++    req_state = tl.load(idx_mapping_ptr + req)
++    if req_state < 0:
++        return
++    token = tl.load(lookup_tokens_ptr + req * lookup_tokens_stride + step).to(tl.int64)
++    tl.store(draft_tokens_ptr + req * draft_tokens_stride + step, token)
++    if HAS_LOGITS:
++        row = (
++            draft_logits_ptr
++            + req_state * draft_logits_stride_0
++            + step * draft_logits_stride_1
++        )
++        offsets = tl.arange(0, BLOCK_V)
++        neg_inf = tl.full((BLOCK_V,), float("-inf"), tl.float32)
++        for start in range(0, vocab_size, BLOCK_V):
++            mask = start + offsets < vocab_size
++            tl.store(row + start + offsets, neg_inf, mask=mask)
++        tl.store(row + token, 0.0)
++
++
++@triton.jit
+ def _prepare_prefill_inputs_kernel(
+     last_token_indices_ptr,
+     draft_current_step_ptr,

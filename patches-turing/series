@@ -31,3 +31,4 @@ marlin-prefill-only-int8.patch
 spec-attn-register-softmax.patch
 gdn-chunk-o.patch
 envs-knobs.patch
+mtp-lookup-v2.patch

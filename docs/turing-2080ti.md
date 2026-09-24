@@ -1,7 +1,7 @@
 # Turing (SM75): Qwen3.8-27B on a 22 GB RTX 2080 Ti
 
 This branch adds a Turing port to the 3090 stack. `patches-turing/` is a
-21-patch series applied after upstream's `patches/series`, on the same
+22-patch series applied after upstream's `patches/series`, on the same
 vLLM 0.29.0 pin, and it runs the same serving setup on a card that is 8 GB
 smaller and one generation older: an RTX 2080 Ti with 22 GB, running at 280 W
 (the card's factory cap is 250 W). The 0.29.0 rebase and its validation are
@@ -97,9 +97,9 @@ vllm serve models/Qwen3.8-27B-W4A16-AutoRound \
 
 `--kv-cache-memory 5905580032` is the whole budget the card has for KV at this
 context: raise it for a longer context, lower it if the model does not load.
-On vLLM 0.29.0, also set `VLLM_USE_V2_MODEL_RUNNER=0`: the MTP history lookup
-lives in the V1 proposer, and the 0.29 default (V2) silently drops it (prose is
-at parity between the two, copy/edit is ~3% ahead on V1).
+The MTP history lookup runs on both vLLM 0.29.0 runners (`mtp-history-lookup`
+in the V1 proposer, `mtp-lookup-v2` in the V2 MTPSpeculator), so the V2 default
+is fine; `VLLM_USE_V2_MODEL_RUNNER=0` is only for comparing against V1.
 `--load-format runai_streamer` with `--model-loader-extra-config
 '{"concurrency":2,"memory_limit":1610612736}'` is worth adding on a host with
 little RAM; it made the difference between a clean load and an OOM kill on an

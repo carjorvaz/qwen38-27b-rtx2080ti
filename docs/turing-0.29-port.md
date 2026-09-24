@@ -103,6 +103,16 @@ runtime and run as production:
   (`VLLM_USE_V2_MODEL_RUNNER=0`) to keep it; on copy-shaped traffic V1+lookup
   measured 96.3/101.5 tok/s against V2's 93.8/98.0.
 
+**The lookup on the V2 runner.** The MTP history lookup now exists on both
+runners: the original in the V1 proposer, and `mtp-lookup-v2.patch` in the V2
+`MTPSpeculator` (matching the runner's `all_token_ids` history, with the same
+gate and a point-mass draft distribution, device-side only). On the V2 runner
+the 32k-word verbatim copy measures acceptance 4.19-4.22 and 107.1-107.9 tok/s
+against the V2 baseline's 3.66-3.84 and 93.8-98.0, and V1+lookup's 3.73-3.93
+and 96.3-101.5. Prose is at parity (8k acceptance 3.969, 117.7/113.5 tok/s;
+32k 3.97, 101.9), sampled traffic is untouched, and GSM8K n=100 reads 94.0%.
+Production runs V2 (the upstream default) instead of being pinned to V1.
+
 A record of the raw-completion API bench (`bench/turing_api_bench.py
 --corpus wikitext`) on 0.29.0 V1: 88.6 / 107.7 / 78.9 / 83.2 / 59.0 tok/s at
 2k / 8k / 32k / 64k / 128k. Those numbers are prompt-sensitive — acceptance
@@ -111,8 +121,9 @@ so they are a record, not a like-for-like replacement for the 0.28.0 table.
 
 ## Open items
 
-- The lookup is not ported to the V2 `MTPSpeculator`; V1 is pinned instead
-  (parity on prose, ahead on copy).
+- The lookup runs on both runners; V1 keeps the older, shared-score path and
+  V2 is the default. The V2 path is the one to measure first if a bug appears,
+  since it is the newest code.
 - Upstream's confidence-scored adaptive verification is DSpark-only and the
   single spec-stride cudagraph assumption is unchanged, so the fork's adaptive
   verify block keeps its 0.28 verdict (it loses ~4%); see the ops exec plan.
