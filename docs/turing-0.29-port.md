@@ -10,7 +10,7 @@ pin flip (upstream's own port notes are in [vllm-0.29.md](vllm-0.29.md)), the
 series-hygiene pass (a `patches/series` apply order, `--fuzz 0` everywhere,
 patches regenerated with exact context), and 116 commits of fixes and docs.
 `patches/` is upstream's 0.29.0 series unmodified — 44 patches applied in
-`patches/series` order — and `patches-turing/` is the 21-patch Turing series
+`patches/series` order — and `patches-turing/` is the 22-patch Turing series
 regenerated on top of it.
 
 The rebase itself: every vLLM-side hunk the Turing patches touch was replayed
