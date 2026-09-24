@@ -61,6 +61,11 @@ otherwise produces wrong results or does not run.
 | `prefill-memory-and-extend` | optional bounded KV staging and a separate small-query split-KV path | [follow-up measurements](turing-prefill.md) |
 | `marlin-prefill-only-int8` | optional transient W4A8 repacking for large-M target GEMMs; canonical decode weights stay intact | lossy prefill mode; [quality and limits](turing-prefill.md) |
 
+Standalone GPU tests cover the native kernels, with no model and no server:
+`python bench/test_turing_prefill.py`, `bench/test_turing_marlin.py`, and
+`bench/test_turing_gdn.py` (chunk state and chunk output against their Triton
+references, plus timing).
+
 ## Running it
 
 Install vLLM 0.28.0, apply both patch directories (`patches-turing/README.md`
@@ -73,7 +78,7 @@ vllm serve models/Qwen3.8-27B-W4A16-AutoRound \
   --kv-cache-dtype int4_per_token_head \
   --mamba-cache-dtype float16 --mamba-ssm-cache-dtype float16 --mamba-cache-mode align \
   --kv-cache-memory 5905580032 --max-model-len 262144 \
-  --max-num-seqs 1 --max-num-batched-tokens 2048 \
+  --max-num-seqs 1 --max-num-batched-tokens 4096 \
   --enable-prefix-caching --prefix-match-unit 16 \
   --speculative-config '{"method":"mtp","num_speculative_tokens":4,"attention_backend":"TRITON_ATTN","draft_sample_method":"probabilistic"}' \
   --compilation-config '{"mode":"VLLM_COMPILE","cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["+rms_norm","+silu_and_mul"],"max_cudagraph_capture_size":8}' \

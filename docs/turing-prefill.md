@@ -198,6 +198,9 @@ vLLM. Start with one flag at a time; use an idle GPU for kernel benchmarks.
 ```bash
 python bench/test_turing_prefill.py
 python bench/test_turing_marlin.py
+# Native GDN chunk state and chunk output against their Triton references. The
+# 32k timing case and Triton's autotuning want a free GPU, not a loaded one.
+python bench/test_turing_gdn.py
 
 python bench/turing_attention_bench.py \
   --window 16384 --extend-max 32 --segments 32 \
