@@ -176,6 +176,16 @@ Kept here so nobody re-derives them:
   indexes the block table assuming a full-causal layout.
 - **warpN=32 or 128 in the prefill tile**: the first does not compile, the
   second is 5x slower. Two blocks per SM gained 3% at 64k and nothing at depth.
+- **Smaller key tiles in the prefill attention** (`kKeysPerBlock` 128 or 64, to
+  trade tile reuse for more resident CTAs): neither compiles. The pinned
+  PyTorch template keeps the fp32 output accumulator in registers only while
+  `kMaxK <= kKeysPerBlock`; below that it needs a shared accumulator buffer,
+  which the port static-asserts against — and that buffer would consume the
+  shared memory the extra occupancy was meant to buy. The 32-query x 256-key
+  tile is the only shape this card fits, so a faster prefill attention needs a
+  purpose-built kernel, not a parameter change, and it is the largest item
+  left: 25% of a cold 32k prefill and 67% of a long-context chunk at ~30
+  TFLOPS effective.
 
 ## Known limits
 
