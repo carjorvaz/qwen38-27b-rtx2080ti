@@ -13,13 +13,11 @@ Measured on that card at 280 W, single stream, real prompts:
     context / KV pool     262,144 tokens / 5.5 GiB int4
     quality               10.88 PPL wikitext-2, 94.5% GSM8K (200 questions)
 
-`patches-turing/` is the port, applied after upstream's `patches/`; each patch
+`patches-turing/` is the port, applied after upstream's `patches/`. Each patch
 carries its own measurements in its header. The series-wide numbers, including
 what was measured and rejected, are in [docs/turing-2080ti.md](docs/turing-2080ti.md).
-The optional prefill work (bounded KV staging, a transient int8 mode, and what
-they cost in quality) is in [docs/turing-prefill.md](docs/turing-prefill.md).
-The rest of the tree — docs, prepare, bench, batch — is upstream's and documents
-the 3090 stack.
+The optional prefill work, including bounded KV staging and transient int8
+GEMMs, is in [docs/turing-prefill.md](docs/turing-prefill.md).
 
 ## Running it
 
@@ -39,8 +37,7 @@ vllm serve models/Qwen3.8-27B-W4A16-AutoRound \
   --async-scheduling
 ```
 
-Three optional environment variables decide the prefill/quality trade; all are
-off by default, and the first two are free:
+Optional prefill settings, all off by default:
 
     VLLM_TURING_PREFILL_WINDOW=16384   bound the FP16 attention staging
     VLLM_TURING_EXTEND_MAX=32          split-KV path for short extensions
@@ -48,8 +45,8 @@ off by default, and the first two are free:
 
 Model preparation (requantized embeddings and lm_head, int4 MTP draft) is in
 [prepare/](prepare/). `single-user/` has a launcher and a systemd unit, and
-`bench/` has the harnesses the numbers above came from. Batch mode belongs to
-upstream: this card has no room for a second KV pool.
+`bench/` has the harnesses the numbers above came from. There is no room on
+this card for batch mode's second KV pool.
 
 ## Credit
 
