@@ -7,11 +7,20 @@ MTP speculative decoding, prefix caching and an int8 prefill path.
 
 Measured on that card at 280 W, single stream, real prompts:
 
-    cold 32k prefill      31.9 s
-    cold 253k prefill     625 s, 0 preemptions
-    decode                112 tok/s at 2k, 52.9 ms/step at 128k
-    context / KV pool     262,144 tokens / 5.5 GiB int4
-    quality               10.88 PPL wikitext-2, 94.5% GSM8K (200 questions)
+| context | prefill tok/s | decode tok/s |
+| ---: | ---: | ---: |
+| 2k | — | 112.3 |
+| 8k | — | 97.7 |
+| 32k | 624 | 96.6 |
+| 64k | 464 | 71.6 |
+| 128k | — | 65.6 |
+| 248k | ~240 | — |
+
+Prefill rows are tail prefills at depth — extending a session at that context,
+which is what a long turn costs. From an empty cache the card does 1027 tok/s
+at 32k (31.9 s) and 406 tok/s at 253k (625 s, 0 preemptions). The KV pool is
+262,144 tokens / 5.5 GiB of int4; quality is 10.88 PPL on wikitext-2 and 94.5%
+on GSM8K (200 questions).
 
 `patches-turing/` is the port, applied after upstream's `patches/`. Each patch
 carries its own measurements in its header. The series-wide numbers, including
