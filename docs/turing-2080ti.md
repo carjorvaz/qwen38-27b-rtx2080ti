@@ -158,6 +158,12 @@ the noise of 200 questions.
 
 Kept here so nobody re-derives them:
 
+- **The transient int8 repack kernel** (`turing_marlin_prefill.py`) runs at
+  68 GB/s of a 616 GB/s memory floor: it is gather-bound, and the gather is
+  inherent -- one output tile reads 1024 nibbles scattered over a window of up
+  to N*16 nibbles (139 KB at N=17408), so there is no contiguous source block
+  to stage. Warp counts 1/2/4 measure the same and 8 is worse. It costs 0.55 s
+  of a 32k prefill (1.7%) and is the price of the transient layout.
 - **Native ports of the remaining FLA GDN kernels** (`chunk_scaled_dot_kkt_fwd`,
   `recompute_w_u_fwd`). Both do their products with `tl.dot`, i.e. SIMT on
   SM75, but they are latency-bound well above their bandwidth floor (72 KB of
