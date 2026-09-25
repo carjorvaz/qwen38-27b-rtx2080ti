@@ -5,42 +5,42 @@ vLLM 0.29.0 serving stack to Turing (SM75). One RTX 2080 Ti with 22 GB runs
 Qwen3.8-27B at 262,144 tokens of context out of a 5.5 GiB int4 KV pool, with
 MTP speculative decoding, prefix caching and an int8 prefill path.
 
-Measured on that card at 280 W, single stream, real prompts:
+Measured on that card at 280 W, single stream, on the vLLM 0.29.0 stack (V2
+runner, `VLLM_MTP_LOOKUP=1`, MTP k=4). Decode uses chat-shaped Wikitext-2
+prompts, greedy sampling and 128 output tokens (`qwen38-sm75-bench
+--text-file`):
 
 Decode:
 
 | context | tok/s |
 | ---: | ---: |
-| 2k | 112.3 |
-| 8k | 97.7 |
-| 32k | 96.6 |
-| 64k | 71.6 |
-| 128k | 65.6 |
+| 2k | 113.4 |
+| 8k | 112.4 |
+| 32k | 99.8 |
+| 64k | 80.6 |
+| 128k | 80.4 |
+| 253k | 51.6 |
 
-Tail prefill, extending an existing session:
+Tail prefill, extending an existing session by 2048 tokens
+(`bench/turing_api_bench.py --corpus wikitext --tails 2048`):
 
 | context depth | tok/s |
 | ---: | ---: |
-| 32k | 624 |
-| 64k | 464 |
-| 248k | ~240 |
+| 32k | 729 |
+| 64k | 525 |
+| 253k | ~210 |
 
-From an empty cache, 32k took 31.9 s (1,027 tok/s) and 253k took 625 s
-(406 tok/s, 0 preemptions).
+From an empty cache, 32k took 31.9 s (1,028 tok/s) and 253k took 628 s
+(404 tok/s, 0 preemptions).
 
-Quality with the int4 KV cache: 10.88 PPL on wikitext-2 and 94.5% on GSM8K
-(200 questions).
+Quality with the int4 KV cache: 10.88 PPL on wikitext-2 and 94.8% on GSM8K
+(500 questions).
 
 `patches-turing/` is the port, applied after upstream's `patches/series`. Each
-patch carries its own measurements in its header. The port was re-validated on
-vLLM 0.29.0 on the card: quality is unchanged (PPL 10.88, GSM8K 95.5%) and
-decode is equal or better on the deployment's bench, so the per-context numbers
-above remain the 0.28.0 run. The 0.29.0 rebase, the four retirements and the
-full validation record are in
-[docs/turing-0.29-port.md](docs/turing-0.29-port.md). The series-wide numbers,
-including what was measured and rejected, are in
-[docs/turing-2080ti.md](docs/turing-2080ti.md). The optional prefill work,
-including bounded KV staging and transient int8 GEMMs, is in
+patch carries its own measurements in its header. The
+[0.29.0 port notes](docs/turing-0.29-port.md) cover validation. The older
+0.28.0 results and patch-by-patch measurements are in
+[docs/turing-2080ti.md](docs/turing-2080ti.md); optional prefill work is in
 [docs/turing-prefill.md](docs/turing-prefill.md).
 
 ## Running it
