@@ -55,6 +55,11 @@ The tail patch `envs-knobs.patch` registers the Turing series' knobs in
 raw `os.environ` read in a file that 0.29 no longer imports `os` in, so this
 patch also removes a crash on the ported tree.
 
+`mtp-lookup-v2.patch`, added after the port, brings the MTP history lookup to
+the V2 runner that 0.29 runs by default (the original patch has the V1
+proposer); the rest of the series is unchanged since the port. Measurements are
+in the patch header and [docs/turing-0.29-port.md](../docs/turing-0.29-port.md).
+
 `docs/turing-2080ti.md` explains what each patch is for and what the result
 measures, including the parts that were measured and rejected. The two optional
 prefill follow-ups, their quality trade-offs and GPU regression commands are in

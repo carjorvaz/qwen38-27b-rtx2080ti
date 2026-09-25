@@ -94,14 +94,16 @@ runtime and run as production:
 - Quality, same harness as the 0.28 numbers, greedy: PPL **10.8818** (en
   10.8096, da 10.9401; 25,092 tokens) against 10.8797 on 0.28.0, and GSM8K
   **95.5%** (n=200) against 94.5%. The optional uncensored checkpoint on the
-  same runtime: PPL **10.9337** against 10.94 and GSM8K **97.5%** against 96.5%.
+  same runtime: PPL **10.9337** against 10.94 and GSM8K **95.2%** (n=500)
+  against the target's 94.8% — indistinguishable; the earlier n=200 97.5% vs
+  95.5% was inside the interval.
 - Runner: 0.29.0 defaults to the V2 model runner. Same-session V1 against V2 on
   realistic text at identical acceptance is parity (33.9/34.3/37.8/43.5 ms
   against 34.1/34.9/37.9/43.1 ms at 2k/8k/32k/64k) and the production bench is
-  equal or better at every depth than the 0.28 table. The Turing MTP history
-  lookup exists only in the V1 proposer, so the deployment pins V1
-  (`VLLM_USE_V2_MODEL_RUNNER=0`) to keep it; on copy-shaped traffic V1+lookup
-  measured 96.3/101.5 tok/s against V2's 93.8/98.0.
+  equal or better at every depth than the 0.28 table. The MTP history lookup
+  runs on both runners, so production keeps the V2 default; on copy-shaped
+  traffic V2+lookup measures 107.1/107.9 tok/s against V2's 93.8/98.0 and
+  V1+lookup's 96.3/101.5.
 
 **The lookup on the V2 runner.** The MTP history lookup now exists on both
 runners: the original in the V1 proposer, and `mtp-lookup-v2.patch` in the V2

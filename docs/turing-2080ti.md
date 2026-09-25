@@ -60,6 +60,8 @@ otherwise produces wrong results or does not run.
 | `gdn-chunk-o` | native fp16 WMMA replacement for FLA's Triton chunk-output kernel, whose `tl.dot` lowers to SIMT on SM75 | 61.3 -> 14.8 ms per layer at T=32k (4.1x); cold 32k 36.3 -> 34.0 s, +32k tail at 48k 50.8 -> 48.6 s, to 128k 145.2 -> 140.8 s |
 | `gdn-state-16w` | the same state kernel at 16 warps instead of 4, same 48 KiB tile, bitwise identical output | 5.67 -> 1.98 ms per 2048-token chunk per layer (3.1x); cold 32k 34.0 -> 31.9 s, +32k tail at 48k 48.6 -> 46.3 s, to 128k 140.8 -> 135.9 s |
 | `sampling-log` | logs effective sampling parameters per request (unconditional INFO line) | tooling; explains why greedy-only lookup drafting |
+| `envs-knobs` | registers the series' `VLLM_TURING_*`/`VLLM_MTP_*` knobs in `envs.py` and reads them through `envs` | tooling; no measured change |
+| `mtp-lookup-v2` | the MTP history lookup on the V2 `MTPSpeculator`, which 0.29 runs by default; same gate, point-mass draft distribution, device-side | 32k-word copy acceptance 4.19-4.22 at 107 tok/s against the V2 baseline's 3.66-3.84 at 94-98; prose parity |
 | `prefill-memory-and-extend` | optional bounded KV staging and a separate small-query split-KV path | [follow-up measurements](turing-prefill.md) |
 | `marlin-prefill-only-int8` | optional transient W4A8 repacking for large-M target GEMMs; canonical decode weights stay intact | lossy prefill mode; [quality and limits](turing-prefill.md) |
 

@@ -67,6 +67,11 @@ Optional prefill settings, all off by default:
     VLLM_TURING_EXTEND_MAX=32          split-KV path for short extensions
     VLLM_TURING_PREFILL_INT8=mlp       transient int8 GEMMs; +0.97% PPL
 
+The MTP history lookup is off by default and runs on both 0.29.0 runners
+(`VLLM_MTP_LOOKUP=1`; on copy/edit work it drafts from the request's own
+history). Its own measurements and gates are in
+[docs/turing-2080ti.md](docs/turing-2080ti.md).
+
 Model preparation (requantized embeddings and lm_head, int4 MTP draft) is in
 [prepare/](prepare/). `single-user/` has a launcher and a systemd unit, and
 `bench/` has the harnesses the numbers above came from. There is no room on
