@@ -1,14 +1,23 @@
 # Docker, and WSL2
 
+> **WSL2 + RTX 3090 checklist** — full path: [quickstart.md](quickstart.md).
+> 1. `cp .env.example .env` and `make keygen` (never commit `.env`).
+> 2. Keep `VLLM_WSL2_ENABLE_PIN_MEMORY=1` or the V2 runner aborts on UVA.
+> 3. First boot takes 2–15 min; follow it with `make logs`.
+> 4. Boot OOM? Fall back to `GPU_UTIL=0.93` in `.env`.
+> 5. Exit 137 in prepare? Raise WSL memory (`memory=20GB`, `swap=8GB`), then `wsl --shutdown`.
+> 6. Verify with `make doctor`. Stuck? See [gotchas.md](gotchas.md).
+
+
 The container image (same stack, frozen) and an independent WSL2 reproduction with its memory caveats.
 
 [← back to the main README](../README.md)
 
-The container image is the same stack, frozen: Python 3.12 venv, vLLM 0.29.0 pinned
+The container image is the same stack, frozen: Python 3.12 venv, vLLM 0.31.0 pinned
 (torch 2.13 / cu130 / Triton 3.7.1), every compatible patch in `patches/` applied
 (`dflash2-backport.patch` is retired because DFlash2 is native since v0.28.0), and
-`verify.sh --install` run at build time, KVarN preinstalled (its 0.29 port is
-described in [vllm-0.29.md](vllm-0.29.md)). Host prerequisites:
+`verify.sh --install` run at build time, KVarN preinstalled (its 0.31 port is
+described in [vllm-0.31.md](vllm-0.31.md)). Host prerequisites:
 an NVIDIA driver that speaks CUDA 13 (≥ 580), Docker with the
 [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
 configured as a runtime. The 250 W power limit is a host setting
@@ -18,7 +27,7 @@ configured as a runtime. The 250 W power limit is a host setting
 git clone https://github.com/syv-ai/HyperQwen && cd HyperQwen
 cp .env.example .env                              # all knobs live in .env (gitignored)
 # PowerShell: Copy-Item .env.example .env
-echo "VLLM_API_KEY=$(openssl rand -hex 24)" >> .env   # skip only if the port stays on this machine
+echo "VLLM_API_KEY=$(openssl rand -hex 24)" >> .env   # skip only if the port stays on this machine (compose publishes on 127.0.0.1; add BIND=0.0.0.0 to serve other machines)
 docker compose --profile single up -d               # or --profile batch
 docker compose logs -f single
 ```
@@ -107,7 +116,7 @@ separate `prepare` service, nothing the image needs. The same server, one
 command, no checkout:
 
 ```bash
-docker run -d --name qwen --gpus all --ipc=host -p 18020:18020 \
+docker run -d --name qwen --gpus all --ipc=host -p 127.0.0.1:18020:18020 \
   -v qwen-models:/app/models -v qwen-cache:/cache \
   --restart unless-stopped ghcr.io/syv-ai/hyperqwen:latest
 ```

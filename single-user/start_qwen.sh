@@ -54,8 +54,10 @@
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# flashinfer-cubin (the no-nvcc route, README Setup) publishes 0.6.13 against
-# flashinfer-python 0.6.16.post3; without this the import refuses the pair (#35).
+# flashinfer-cubin (the no-nvcc route, docs/install.md) must match flashinfer-python.
+# This used to cover a pair PyPI could not match (cubin 0.6.13 against python
+# 0.6.16.post3, #35); install.md now takes the cubin from flashinfer.ai at the
+# same version, so the export is kept only for venvs built the old way.
 export FLASHINFER_DISABLE_VERSION_CHECK=1
 
 # A dead engine leaves its OffloadingConnector region behind as
@@ -97,6 +99,11 @@ fi
 source "$REPO/resolve_config.sh" \
   || { echo "start_qwen: cannot source $REPO/resolve_config.sh - refusing to boot unvalidated" >&2; exit 1; }
 resolve_effective_config single
+source "$REPO/launcher_common.sh" \
+  || { echo "start_qwen: cannot source $REPO/launcher_common.sh - refusing to boot" >&2; exit 1; }
+# KV_OFFLOAD_GB=N: the CPU KV tier as a flag, ahead of everything below that reads EXTRA_ARGS.
+qwen_kv_offload_args
+qwen_kv_offload_shm_check
 
 source "$REPO/single-user/select_model.sh"
 PORT=${PORT:-18020}
@@ -136,8 +143,7 @@ SSE_KEEP_ALIVE=${SSE_KEEP_ALIVE-30}   # no colon: SSE_KEEP_ALIVE= keeps the empt
 # codegen bug with the mixed set; use mlp or all.
 INT8_ACT=${INT8_ACT-}
 INT8_LAYERS=${INT8_LAYERS-mlp|linear_attn|self_attn}
-[ -n "$INT8_ACT" ] && export VLLM_MARLIN_INPUT_DTYPE=$INT8_ACT
-[ -n "$INT8_ACT" ] && [ -n "$INT8_LAYERS" ] && export VLLM_MARLIN_INT8_INCLUDE_RE=$INT8_LAYERS
+qwen_int8_exports "$INT8_ACT" "$INT8_LAYERS"
 # PREFILL_ATTN=int8: int8-QK Triton attention for the hd256 full-attention
 # layers during prefill (patches/prefill-attn-int8.patch): 1.27-1.35x FA2 on
 # the attention itself, worth up to ~+5% end-to-end at 51k on top of INT8_ACT
@@ -489,7 +495,6 @@ if [ "$SPEC" = "dflash2" ]; then
          "miss is a loud OutOfMemoryError; on WSL2 it is SILENT: no error, prefill" \
          "5-10x slower. Ladder 4k/16k TTFT against known-good rates before trusting it." >&2
   fi
-  [ -n "$KV_MEM" ] && EXTRA_ARGS="--kv-cache-memory=$KV_MEM ${EXTRA_ARGS}"
 elif [ "$SPEC" = "off" ] || [ "$SPEC" = "none" ]; then
   MAX_SEQS=${MAX_SEQS:-8}
   SPEC_CFG=""
@@ -503,6 +508,11 @@ else
   echo "silently running mtp -- an unrecognized SPEC in an A/B measures the wrong thing." >&2
   exit 1
 fi
+# The pin applies in every mode. The dflash2 branch above gives KV_MEM a default; under
+# mtp and off it is only ever the user's own export (docs/multi-gpu.md's "pin the KV
+# pool"). It used to be passed inside the dflash2 branch alone, so SPEC=mtp and SPEC=off
+# ignored an exported KV_MEM without a word (#68, #210).
+[ -n "${KV_MEM:-}" ] && EXTRA_ARGS="--kv-cache-memory=$KV_MEM ${EXTRA_ARGS}"
 SPEC_ARGS=()
 [ -n "$SPEC_CFG" ] && SPEC_ARGS=(--speculative-config "$SPEC_CFG")
 
@@ -516,39 +526,49 @@ if [ "${PREFIX_CACHE:-0}" = "1" ]; then
   # hits land on tile boundaries (a non-multiple of 128 corrupts the pool).
   [ "$CTX" = "huge" ] && EXTRA_ARGS="--prefix-match-unit 128 ${EXTRA_ARGS}"
   # CTX=huge + DFlash2: retain one Mamba state snapshot in six rather than one per
-  # block (#174). vLLM's default is dense, and at dense the snapshots of two long
+  # block (#174). 0.29's default was dense, and at dense the snapshots of two long
   # conversations advanced in turn do not fit beside each other: on the reference
   # 3090 two ~32.6K chats alternating reused 0% and re-prefilled for 31.8 s on every
   # turn; with one in six they reuse 93-99.5% at 0.4-2.6 s (0.28). On 0.29 the first
   # reuse after a cold turn lands on the last retained snapshot, not the last block: at
   # 32.6K a side it was 80.0% (26,112 = 2 x 13056) at 7.0 s, then 99.3-99.4% at ~0.5 s
-  # from the next turn on, against 0% and ~29 s per turn dense. One ~103K chat on its own
-  # keeps 98.7-99.8%, and a passcode inside the reused prefix comes back right 3/3,
-  # so the sparser restore path returns the right state.
+  # from the next turn on, against 0% and ~29 s per turn dense. On 0.30 the first reuse
+  # lands further in: 86.6% (28,288) at 4.7-5.0 s at 32.6K a side, and one ~60K chat
+  # reuses 94.5% (56,576) at 4.1 s where 0.29 reuses 87.2% at 8.9-9.0 s. One ~103K
+  # chat on its own keeps 98.7-99.8%, and a passcode inside the reused prefix comes
+  # back right 3/3, so the sparser restore path returns the right state.
   # The interval is in tokens and vLLM refuses one that is not a multiple of the
   # attention block, and that block moves with the draft count (the Mamba page holds
   # the speculative state slots): 2176 at 7 drafts, 2432 at 15, both measured. Other
   # draft counts stay dense and say how to set it by hand. PREFIX_RETENTION= (empty)
   # forces dense; --prefix-cache-retention-interval in EXTRA_ARGS always wins, then an
   # exported VLLM_PREFIX_CACHE_RETENTION_INTERVAL.
-  # On 0.29 the interval has to go in as the flag. `vllm serve` still reads the
-  # deprecated env var (and logs the deprecation), but the flag's own unset default
-  # overrides it, so hybrid + EAGLE falls back to dense with no error: an exported
-  # 13057, which the flag refuses, boots. An exported value is carried over as the flag.
-  if [ "$CTX" = "huge" ] && [ "$SPEC" = "dflash2" ]; then
+  # Every draft profile passes the interval explicitly, because vLLM's unset default moved. 0.29
+  # resolved it to dense for a hybrid model with a draft (vllm #55760, merged to the 0.29 release
+  # branch only); 0.30's is 0, which keeps only the replay boundaries. Measured on the reference
+  # 3090 with the interval unset (one ~20K conversation, 1,000-token replies): 0.30's hit stops
+  # inside the previous PROMPT, two blocks (864 tokens) short of 0.29's, which reached a few hundred
+  # tokens into the reply (87-90% hit against 91-94%, ~0.7-0.8 s a turn). With None (dense), 0.30
+  # prefills a fresh ~20-22K and 37-48K prompt within 0.5% of both. So: the measured interval above for CTX=huge
+  # DFlash2 at 7/15 drafts, else None, which is 0.29's behaviour. The flag in EXTRA_ARGS wins, then
+  # an exported VLLM_PREFIX_CACHE_RETENTION_INTERVAL (a spelling 0.30 no longer reads, carried
+  # over as the flag), then PREFIX_RETENTION (0 keeps boundaries only; empty means dense).
+  if [ -n "$SPEC_CFG" ]; then
     case " ${EXTRA_ARGS:-} " in
       *"--prefix-cache-retention-interval"*) ;;
       *)
-        case $DRAFT_TOKENS in 7) RETENTION=13056 ;; 15) RETENTION=14592 ;; *) RETENTION= ;; esac
+        RETENTION=
+        if [ "$CTX" = "huge" ] && [ "$SPEC" = "dflash2" ]; then
+          case $DRAFT_TOKENS in 7) RETENTION=13056 ;; 15) RETENTION=14592 ;; esac
+          if [ -z "$RETENTION" ] && [ -z "${PREFIX_RETENTION+x}" ] && [ -z "${VLLM_PREFIX_CACHE_RETENTION_INTERVAL+x}" ]; then
+            echo "[start_qwen] CTX=huge DFLASH_TOKENS=$DRAFT_TOKENS: no measured block size, so" \
+                 "prefix retention stays dense and two long conversations advanced in turn will" \
+                 "evict each other (#174). Set PREFIX_RETENTION to 6x the 'attention block size'" \
+                 "line this boot prints." >&2
+          fi
+        fi
         RETENTION=${VLLM_PREFIX_CACHE_RETENTION_INTERVAL-${PREFIX_RETENTION-$RETENTION}}
-        if [ -n "$RETENTION" ]; then
-          EXTRA_ARGS="--prefix-cache-retention-interval $RETENTION ${EXTRA_ARGS}"
-        elif [ -z "${PREFIX_RETENTION+x}" ] && [ -z "${VLLM_PREFIX_CACHE_RETENTION_INTERVAL+x}" ]; then
-          echo "[start_qwen] CTX=huge DFLASH_TOKENS=$DRAFT_TOKENS: no measured block size, so" \
-               "prefix retention stays dense and two long conversations advanced in turn will" \
-               "evict each other (#174). Set PREFIX_RETENTION to 6x the 'attention block size'" \
-               "line this boot prints." >&2
-        fi ;;
+        EXTRA_ARGS="--prefix-cache-retention-interval ${RETENTION:-None} ${EXTRA_ARGS}" ;;
     esac
     unset VLLM_PREFIX_CACHE_RETENTION_INTERVAL
   fi
@@ -662,7 +682,11 @@ TOOL_PARSER=${TOOL_PARSER:-qwen3_coder}
 # Array, not $( [ ] && echo ): exits 1 when TOOLS is off (the shape #59 fixed)
 # and word-splits $TOOL_PARSER; the array keeps the parser as one element.
 TOOL_ARGS=()
-[ "${TOOLS:-1}" = 1 ] && TOOL_ARGS=(--enable-auto-tool-choice --tool-call-parser "$TOOL_PARSER")
+# --tool-strict-level (new in vLLM 0.31): its default, auto, enforces a tool's argument schema only when the tool
+# says strict: true, so a forced call (tool_choice=required) to a tool with no parameters invented arguments on
+# 0.31 in 20 of 20 seeds where 0.30 sent {}; parameter holds every tool to its schema, as 0.30 did, and sent {}
+# 20 of 20. TOOL_STRICT=auto restores upstream's default; a --tool-strict-level in EXTRA_ARGS wins.
+[ "${TOOLS:-1}" = 1 ] && TOOL_ARGS=(--enable-auto-tool-choice --tool-call-parser "$TOOL_PARSER" --tool-strict-level "${TOOL_STRICT:-parameter}")
 
 # REQ_METRICS=1: per-request timing fields in every response plus usage on
 # every request (--enable-per-request-metrics --enable-force-include-usage,
@@ -718,6 +742,12 @@ if [ "${VISION:-0}" = 1 ]; then
 else
   VISION_ARGS="--language-model-only"
 fi
+# EMBED_UVA=1 keeps the quantized token embedding in pinned host RAM, read through a CUDA UVA view
+# (patches/qwen3_5-embed-uva.patch, VLLM_EMBED_UVA). The freed VRAM goes to the KV pool: +15.7% tokens
+# (204,336 to 236,479) at SPEC=mtp CTX=long on a 3090 at PCIe 4.0 x16, decode and prefill unchanged, for
+# about 2.1 GiB of host RAM and 20 s of boot (#281). Off by default: a card with spare VRAM pays a PCIe
+# read per decode step for nothing, and a narrow slot is unmeasured.
+[ "${EMBED_UVA:-0}" = 1 ] && export VLLM_EMBED_UVA=1
 
 # fp16 activations do not work with the speculative path, and the way you find that out
 # is late and cryptic (#27): the split-KV verify kernel hardcodes tl.bfloat16 for the
@@ -760,6 +790,10 @@ export PATH="$REPO/venv/bin:$PATH"
 # and turning it off costs you the top of the GPU_UTIL range.
 if grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null || [ -n "${WSL_DISTRO_NAME:-}" ]; then
   ALLOC_DEFAULT=expandable_segments:False
+  if [ "${SPEC:-mtp}" = dflash2 ] && [ -z "${VLLM_WSL2_ENABLE_PIN_MEMORY:-}" ]; then
+    export VLLM_WSL2_ENABLE_PIN_MEMORY=1
+    echo "WSL detected + SPEC=dflash2: VLLM_WSL2_ENABLE_PIN_MEMORY=1 (V2 runner needs pinned UVA buffers here; set it explicitly to override)"
+  fi
   [ -z "${PYTORCH_CUDA_ALLOC_CONF:-}" ] && echo \
     "WSL detected: PYTORCH_CUDA_ALLOC_CONF=$ALLOC_DEFAULT (VMM breaks Marlin repack under the paravirt driver; set it explicitly to override)"
 else
@@ -797,12 +831,14 @@ esac
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-$ALLOC_DEFAULT}
 export VLLM_USE_FLASHINFER_SAMPLER=0
 
-source "$REPO/resolve_api_key.sh"
+source "$REPO/resolve_api_key.sh" \
+  || { echo "start_qwen: cannot source $REPO/resolve_api_key.sh - refusing to boot with an unknown key" >&2; exit 1; }
 resolve_vllm_key
+resolve_bind_host
 
-exec venv/bin/vllm serve "$MODEL" \
+qwen_exec venv/bin/vllm serve "$MODEL" \
   --served-model-name qwen3.8-27b \
-  --host ${HOST:-0.0.0.0} --port $PORT \
+  --host $BIND_HOST --port $PORT \
   --gpu-memory-utilization $GPU_UTIL \
   --max-model-len $MAX_LEN \
   --max-num-seqs $MAX_SEQS \

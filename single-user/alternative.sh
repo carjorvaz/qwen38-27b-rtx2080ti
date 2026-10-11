@@ -9,6 +9,11 @@
 # Needs patches/int4-kv-per-token-head.patch (applied by setup like the
 # rest of patches/). Profile contributed in PR #42 (@lachhabw).
 set -e
+# KV_OFFLOAD_GB=N has to become --kv-offloading-size before the allocator default below reads EXTRA_ARGS.
+# shellcheck disable=SC1091
+source "$(dirname "$(cd "$(dirname "$0")" && pwd)")/launcher_common.sh" \
+  || { echo "[alternative] cannot source launcher_common.sh - refusing to boot" >&2; exit 1; }
+qwen_kv_offload_args
 
 if grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null || [ -n "${WSL_DISTRO_NAME:-}" ]; then
   ALLOC_DEFAULT=expandable_segments:False
@@ -29,7 +34,20 @@ export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-$ALLOC_DEFAULT}
 export FLASHINFER_DISABLE_VERSION_CHECK=1
 export VLLM_USE_FLASHINFER_SAMPLER=0
 export PATH="$PWD/venv/bin:$PATH"
-export VLLM_API_KEY="$(cat api_key.txt)"
+# Same key precedence as the launchers (resolve_api_key.sh): exported
+# VLLM_API_KEY wins, api_key.txt is the file fallback, no key = keyless
+# boot like start_qwen.sh (previously: hardcoded `cat api_key.txt`).
+ALT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ALT_REPO="$(dirname "$ALT_DIR")"
+REPO="$ALT_REPO"   # resolve_vllm_key reads $REPO/api_key.txt; unset, the file fallback silently finds nothing and the server boots with no key
+# shellcheck disable=SC1091
+source "$ALT_REPO/resolve_api_key.sh" \
+  || { echo "[alternative] cannot source resolve_api_key.sh - refusing to boot with an unknown key" >&2; exit 1; }
+# shellcheck disable=SC1091
+source "$ALT_REPO/launcher_common.sh" \
+  || { echo "[alternative] cannot source launcher_common.sh - refusing to boot" >&2; exit 1; }
+resolve_vllm_key
+resolve_bind_host
 export VLLM_DFLASH2_LOOKUP=${LOOKUP:-1}
 # The multi-query 3D verify for the int4 cache (patches/spec-decode-int4-kv-mq3d.patch) was opt-in and nothing
 # set it, so this profile ran the stock 2D verify: on a 4090 at 120k, DFlash2 k=7, fresh prefill, decode 43.9 / 26.5 /
@@ -43,8 +61,7 @@ export VLLM_INT4_MQ_3D=${INT4_MQ_3D:-1}
 # so it stays opt-in here too. INT8_LAYERS narrows it the same way.
 INT8_ACT=${INT8_ACT-}
 INT8_LAYERS=${INT8_LAYERS-mlp|linear_attn|self_attn}
-[ -n "$INT8_ACT" ] && export VLLM_MARLIN_INPUT_DTYPE=$INT8_ACT
-[ -n "$INT8_ACT" ] && [ -n "$INT8_LAYERS" ] && export VLLM_MARLIN_INT8_INCLUDE_RE=$INT8_LAYERS
+qwen_int8_exports "$INT8_ACT" "$INT8_LAYERS"
 
 # Ghost regions from a previous OOM-killed server hold host RAM hostage
 # (gotcha: 70 restarts of accumulation); same cleanup as start_qwen.sh.
@@ -54,6 +71,7 @@ if [ "${VLLM_OFFLOAD_KEEP_SHM:-0}" != 1 ]; then
     grep -lqs "$f" /proc/[0-9]*/maps 2>/dev/null || { echo "[alternative] removing stale offload region $f"; rm -f "$f"; }
   done
 fi
+qwen_kv_offload_shm_check
 
 MODEL=${MODEL:-models/Qwen3.8-27B-W4A16-AutoRound}
 DRAFT=${DRAFT:-models/Qwen3.8-27B-DFlash2-W4A16}
@@ -88,6 +106,24 @@ VISION_ARGS="--language-model-only"
 
 PREFIX_ARGS=""
 [ "$PREFIX_CACHE" = 1 ] && PREFIX_ARGS="--enable-prefix-caching --mamba-cache-mode align"
+# With the drafter on, pass the retention interval explicitly: 0.30's unset default is 0 (the replay
+# boundaries only), where 0.29 resolved it to dense (vllm #55760); start_qwen.sh has the measurement.
+# The default here depends on a KV tier (the connector check above): without one it is 0, because at dense two
+# ~60K conversations on this int4 pool evicted each other completely (0 / 0 cached where 0 held 93.5% for both);
+# with one it is None (dense), which the tier serves from (gotcha 60). PREFIX_RETENTION sets it (0 = boundaries
+# only, empty = dense); the flag in EXTRA_ARGS wins.
+if [ "$PREFIX_CACHE" = 1 ] && [ "$SPEC" = dflash2 ]; then
+  case " ${EXTRA_ARGS:-} " in
+    *"--prefix-cache-retention-interval"*) ;;
+    *)
+      case " ${EXTRA_ARGS:-} " in
+        *"--kv-offloading-size"*|*"--kv-transfer-config"*) R_DEFAULT=None ;;
+        *) R_DEFAULT=0 ;;
+      esac
+      if [ "${PREFIX_RETENTION+set}" = set ]; then R=${PREFIX_RETENTION:-None}; else R=$R_DEFAULT; fi
+      PREFIX_ARGS="$PREFIX_ARGS --prefix-cache-retention-interval $R" ;;
+  esac
+fi
 
 # Array, not $( ... || echo ... ): the fallback makes it errexit-safe, but an
 # unquoted expansion still word-splits; match SPEC_ARGS/METRICS_ARGS.
@@ -110,9 +146,9 @@ if [ "${REQ_METRICS:-0}" = 1 ]; then
                 --per-request-spec-decode-metrics "$SPEC_METRICS")
 fi
 
-exec vllm serve "$MODEL" \
+qwen_exec vllm serve "$MODEL" \
   --served-model-name qwen3.8-27b \
-  --host 0.0.0.0 --port $PORT \
+  --host $BIND_HOST --port $PORT \
   --gpu-memory-utilization $GPU_UTIL \
   --max-model-len $MAX_LEN \
   --max-num-seqs $MAX_SEQS \
@@ -128,6 +164,7 @@ exec vllm serve "$MODEL" \
   --enable-prompt-tokens-details \
   "${METRICS_ARGS[@]}" \
   --enable-auto-tool-choice --tool-call-parser qwen3_coder \
+  --tool-strict-level "${TOOL_STRICT:-parameter}" \
   --default-chat-template-kwargs "{\"enable_thinking\": $ENABLE_THINKING}" \
   ${PREFIX_ARGS} \
   ${EXTRA_ARGS}

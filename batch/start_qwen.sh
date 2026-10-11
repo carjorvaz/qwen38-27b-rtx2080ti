@@ -17,7 +17,7 @@
 #    checkpoint); VISION=1 keeps it for a client that sends images
 #  - expandable_segments is required: the DeltaNet prefill kernels allocate
 #    transient workspace and fragment the allocator, OOMs at util >= 0.978 without it
-#  - gpu-memory-utilization 0.95 on vLLM 0.29 (0.972 on 0.28): see the KV=fp8
+#  - gpu-memory-utilization 0.94 on vLLM 0.31 (0.95 on 0.29-0.30, 0.972 on 0.28): see the KV=fp8
 #    branch below for why the default moved with the pin
 #  - max-num-batched-tokens 2048 beats 8192 here: bigger chunks inflate the
 #    profiled activation peak, which shrinks the KV/state page pool
@@ -25,8 +25,10 @@
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# flashinfer-cubin (the no-nvcc route, README Setup) publishes 0.6.13 against
-# flashinfer-python 0.6.16.post3; without this the import refuses the pair (#35).
+# flashinfer-cubin (the no-nvcc route, docs/install.md) must match flashinfer-python.
+# This used to cover a pair PyPI could not match (cubin 0.6.13 against python
+# 0.6.16.post3, #35); install.md now takes the cubin from flashinfer.ai at the
+# same version, so the export is kept only for venvs built the old way.
 export FLASHINFER_DISABLE_VERSION_CHECK=1
 
 # A dead engine leaves its OffloadingConnector region behind as
@@ -69,6 +71,11 @@ fi
 source "$REPO/resolve_config.sh" \
   || { echo "start_qwen: cannot source $REPO/resolve_config.sh - refusing to boot unvalidated" >&2; exit 1; }
 resolve_effective_config batch
+source "$REPO/launcher_common.sh" \
+  || { echo "start_qwen: cannot source $REPO/launcher_common.sh - refusing to boot" >&2; exit 1; }
+# KV_OFFLOAD_GB=N: the CPU KV tier as a flag, ahead of everything below that reads EXTRA_ARGS.
+qwen_kv_offload_args
+qwen_kv_offload_shm_check
 
 MODEL=${MODEL:-$REPO/models/Qwen3.8-27B-W4A16-AutoRound}
 PORT=${PORT:-18020}
@@ -82,7 +89,27 @@ API_SERVERS=${API_SERVERS:-1}
 # KV=int4pth: vLLM's built-in int4 per-token-head KV cache on the Triton
 # attention backend: 262k context with no extra install, ~1.5x slower decode /
 # 2.3x slower prefill at 100k than fp8 (docs/long-context.md).
+# Under WSL2 an unset GPU_UTIL means 0.91, or 0.88 for KV=kvarn, whose unset MAX_LEN there means 131072. Above
+# these the batch pool spills to system RAM (docs/wsl2-4090.md). On a 4090 (0.30, one boot per value), fp8 ran clean
+# up to 0.92, while at 0.93 its first sampled batch needed ~250 MB more than the card had: Windows moved it to system
+# RAM (the adapter's Shared Usage counter stepped 382 -> 632 MB) and 64-way decode fell to 25-40% for the rest of the
+# run. kvarn spills above 0.89 as soon as its KV cache is allocated at boot, and 262144 tokens fit at no setting that
+# stays on the card. fp8 and kvarn each keep one 0.01 step below their highest clean value; int4pth, whose default
+# 0.93 did not spill under WSL2 either, takes fp8's.
+# Native Linux is unchanged, and an explicit GPU_UTIL or MAX_LEN always wins.
+WSL=0
+if grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null || [ -n "${WSL_DISTRO_NAME:-}" ]; then WSL=1; fi
 KV=${KV:-fp8}
+if [ "$WSL" = 1 ]; then
+  if [ "$KV" = "kvarn" ] && [ -z "${MAX_LEN:-}" ]; then
+    MAX_LEN=131072
+    echo "WSL detected: KV=kvarn MAX_LEN=131072 (262144 does not fit without spilling to system RAM; set it explicitly to override)"
+  fi
+  if [ -z "${GPU_UTIL:-}" ]; then
+    if [ "$KV" = "kvarn" ]; then GPU_UTIL=0.88; else GPU_UTIL=0.91; fi
+    echo "WSL detected: GPU_UTIL=$GPU_UTIL (above it the batch pool spills to system RAM; set it explicitly to override)"
+  fi
+fi
 if [ "$KV" = "int4pth" ]; then
   MAX_LEN=${MAX_LEN:-262144}
   GPU_UTIL=${GPU_UTIL:-0.93}
@@ -96,7 +123,16 @@ elif [ "$KV" = "kvarn" ]; then
   export KVARN_POOL_MEM_FRAC=${KVARN_POOL_MEM_FRAC:-0.25}
 else
   MAX_LEN=${MAX_LEN:-150000}
-  # 0.95, not 0.28's 0.972. 0.29 with memory-profile-after-warmup and
+  # 0.94 on 0.31, not 0.30's 0.95. The profiling run skips the GDN layers, so the
+  # worst prefill step is never budgeted: 64 new short prompts in one step (one
+  # /v1/completions request carrying 64 prompts forces it) needed ~624 MiB over rest
+  # on 0.30 and ~650 on 0.31, and 0.31 also rests ~40 MiB higher (FlashInfer 0.7).
+  # On a native 3090 at 0.95 that step left ~12-17 MiB on 0.30 and ran out of memory
+  # on 0.31, whose 64-way burst failed on all 5 boots run without a memory hook. At
+  # 0.94 the step clears by ~174 MiB on 0.31 and ~232 on 0.30 (nvidia-smi peaks at
+  # 50 ms, so upper bounds) and the burst serves 128/128, for a pool of 217,268 tokens
+  # against 225,000 at 0.95 (-3.4%). 0.945 survives by ~54 MiB, too thin to ship.
+  # On 0.29 and 0.30: 0.95, not 0.28's 0.972. 0.29 with memory-profile-after-warmup and
   # cudagraph-memory-from-allocator stops over-reserving ~1.5 GiB (KV 6.09 GiB at
   # 0.972 on 0.28, 7.63 on 0.29, same box and settings), and at 0.972 that ~1.5 GiB
   # was the headroom batch's unprofiled warmup transients lived in: 0.972 OOMs in
@@ -105,7 +141,7 @@ else
   # boot and serve with VISION=0 and 1, 0.972 does not. 0.95 keeps one 0.01 step
   # below the highest value that passed, boots cold to the same pool as warm
   # (219,587 tokens with the tower), and holds at least the pool 0.28 had at 0.972.
-  GPU_UTIL=${GPU_UTIL:-0.95}
+  GPU_UTIL=${GPU_UTIL:-0.94}
   KV_ARGS="--kv-cache-dtype fp8"
 fi
 # int8 activations: "int8" (default) or empty for W4A16; layers: regex on the
@@ -119,7 +155,13 @@ INT8_LAYERS=${INT8_LAYERS-mlp}
 # for that prefix once and paying for it every time: 64 requests sharing a 5.8k-token system
 # prompt (conc 32) take 222 s without it and 17 s with it. Costs ~14% of the KV pool
 # (223,821 -> 193,298 tokens) and nothing on workloads with no shared prefix (870 vs 876
-# tok/s on the 128/512 row). Hybrid models keep this opt-in upstream.
+# tok/s on the 128/512 row). Hybrid models keep this opt-in upstream. (All measured when this
+# flag was added, 2026-08-19, on vLLM 0.27.1.) From vLLM 0.28 on, generative hybrid models get
+# prefix caching by default (EngineArgs dropped 0.27's `and not model_config.is_hybrid`
+# opt-in), so PREFIX_CACHE=0 no longer turns it off and =1 only adds align mode. On 0.30 (a
+# 4090 under WSL2, GPU_UTIL=0.91, a ~5K-token system prompt shared by 32 concurrent
+# requests) caching read 934 output tok/s against 395 with --no-enable-prefix-caching, align made no difference to that shape, and
+# caching cost 1.5% of the pool (212,041 -> 208,762 tokens).
 if [ "${PREFIX_CACHE:-0}" = "1" ]; then
   EXTRA_ARGS="--enable-prefix-caching --mamba-cache-mode align ${EXTRA_ARGS}"
 fi
@@ -143,7 +185,11 @@ TOOL_PARSER=${TOOL_PARSER:-qwen3_coder}
 # Array, not $( [ ] && echo ): exits 1 when TOOLS is off (the shape #59 fixed)
 # and word-splits $TOOL_PARSER; the array keeps the parser as one element.
 TOOL_ARGS=()
-[ "${TOOLS:-1}" = 1 ] && TOOL_ARGS=(--enable-auto-tool-choice --tool-call-parser "$TOOL_PARSER")
+# --tool-strict-level (new in vLLM 0.31): its default, auto, enforces a tool's argument schema only when the tool
+# says strict: true, so a forced call (tool_choice=required) to a tool with no parameters invented arguments on
+# 0.31 in 20 of 20 seeds where 0.30 sent {}; parameter holds every tool to its schema, as 0.30 did, and sent {}
+# 20 of 20. TOOL_STRICT=auto restores upstream's default; a --tool-strict-level in EXTRA_ARGS wins.
+[ "${TOOLS:-1}" = 1 ] && TOOL_ARGS=(--enable-auto-tool-choice --tool-call-parser "$TOOL_PARSER" --tool-strict-level "${TOOL_STRICT:-parameter}")
 
 # REQ_METRICS=1: per-request timing fields + usage on every response (issue #51).
 # Not with --disable-log-stats (the timing fields need the engine-stats path).
@@ -195,11 +241,15 @@ if [ "${VISION:-0}" = 1 ]; then
 else
   VISION_ARGS="--language-model-only"
 fi
+# EMBED_UVA=1 keeps the quantized token embedding in pinned host RAM, read through a CUDA UVA view
+# (patches/qwen3_5-embed-uva.patch, VLLM_EMBED_UVA); the freed VRAM goes to the KV pool. Off by default,
+# numbers and caveats in single-user/README.md (#281).
+[ "${EMBED_UVA:-0}" = 1 ] && export VLLM_EMBED_UVA=1
 
 export PATH="$REPO/venv/bin:$PATH"
 # Off under WSL, where the VMM calls break Marlin repack — see the long note in
 # single-user/start_qwen.sh. Overridable both ways.
-if grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null || [ -n "${WSL_DISTRO_NAME:-}" ]; then
+if [ "$WSL" = 1 ]; then
   ALLOC_DEFAULT=expandable_segments:False
   [ -z "${PYTORCH_CUDA_ALLOC_CONF:-}" ] && echo \
     "WSL detected: PYTORCH_CUDA_ALLOC_CONF=$ALLOC_DEFAULT (VMM breaks Marlin repack under the paravirt driver; set it explicitly to override)"
@@ -239,21 +289,17 @@ export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-$ALLOC_DEFAULT}
 # flashinfer's sampling.cu does not build with older system nvcc (12.0);
 # the attention kernels JIT fine. Remove this if you have a recent CUDA toolkit.
 export VLLM_USE_FLASHINFER_SAMPLER=0
-# "Off" for these is UNSET, not empty. vllm/envs.py registers VLLM_MARLIN_INPUT_DTYPE
-# through env_with_choices(..., None, ["int8", "fp8"]), which rejects "" outright --
-# `ValueError: Invalid value '' ... Valid options: ['int8', 'fp8']` -- so exporting the
-# empty string killed the engine at startup instead of turning the feature off. That is
-# the documented way to disable it (issue #20), so export only when non-empty.
-[ -n "$INT8_ACT" ] && export VLLM_MARLIN_INPUT_DTYPE=$INT8_ACT
-[ -n "$INT8_LAYERS" ] && export VLLM_MARLIN_INT8_INCLUDE_RE=$INT8_LAYERS
+qwen_int8_exports "$INT8_ACT" "$INT8_LAYERS"
 
 # API key: put it in api_key.txt in the repo root, or export VLLM_API_KEY.
-source "$REPO/resolve_api_key.sh"
+source "$REPO/resolve_api_key.sh" \
+  || { echo "start_qwen: cannot source $REPO/resolve_api_key.sh - refusing to boot with an unknown key" >&2; exit 1; }
 resolve_vllm_key
+resolve_bind_host
 
-exec venv/bin/vllm serve "$MODEL" \
+qwen_exec venv/bin/vllm serve "$MODEL" \
   --served-model-name qwen3.8-27b \
-  --host 0.0.0.0 --port $PORT \
+  --host $BIND_HOST --port $PORT \
   --gpu-memory-utilization $GPU_UTIL \
   --max-model-len $MAX_LEN \
   --max-num-seqs $MAX_SEQS \

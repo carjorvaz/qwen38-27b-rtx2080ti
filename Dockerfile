@@ -1,7 +1,8 @@
 # Same stack as the README's venv install, frozen: Python 3.12 venv at /app/venv,
-# vLLM 0.29.0 (torch 2.13 / cu130 / Triton 3.7.1), every compatible patch in
+# vLLM 0.31.0 (torch 2.13 / cu130 / Triton 3.7.1), every compatible patch in
 # patches/ applied,
-# the KVarN KV cache installed, verify.sh --install run at build time.
+# the KVarN KV cache installed, verify.sh --install and the scratch-pool test run at
+# build time.
 #
 # The base image is CUDA "base" + nvcc, not "devel": vLLM's wheels bring their own
 # CUDA libraries, but FlashInfer JIT-compiles its fp8-KV attention kernel with nvcc
@@ -25,18 +26,16 @@ COPY docker/requirements.txt docker/requirements.txt
 RUN venv/bin/pip install -r docker/requirements.txt
 
 COPY . .
-# Patch apply order lives in patches/series: a few patches carry hunk context
-# that an earlier patch adds, so the glob order of patches/*.patch is wrong.
+# patches/apply.sh reads the apply order from patches/series and applies it with --fuzz 0:
+# a few patches carry hunk context that an earlier patch adds, so the glob order of
+# patches/*.patch is wrong.
+# bench/mq3d_scratch_pool_test.py imports the patched triton_attn.py and runs on CPU
+# tensors, so the build is where CI can run it.
 RUN set -e; SP=$(venv/bin/python -c 'import vllm, os; print(os.path.dirname(vllm.__file__))' | tail -n1); \
-    sed -e 's/#.*//' -e 's/^[[:space:]]*//;s/[[:space:]]*$//' -e '/^$/d' patches/series | \
-    while IFS= read -r name; do \
-      case "$name" in \
-        dflash2-backport.patch) echo "== skip $name (DFlash2 is native since vLLM 0.28.0)"; continue ;; \
-      esac; \
-      echo "== $name"; patch -p1 --fuzz 0 --no-backup-if-mismatch -d "$SP" < "patches/$name"; \
-    done; \
+    bash patches/apply.sh "$SP"; \
     bash kvarn/install.sh; \
-    bash verify.sh --install
+    bash verify.sh --install; \
+    venv/bin/python bench/mq3d_scratch_pool_test.py
 
 # HOME is a volume: torch.compile cache (~/.cache/vllm), Triton (~/.triton),
 # FlashInfer JIT (~/.cache/flashinfer), HF hub cache.

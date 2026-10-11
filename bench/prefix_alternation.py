@@ -20,6 +20,11 @@ Regimes are sharp, so read the size table in the issue rather than one run:
     two conversations, sequential       ~96.6-99.7%
     two conversations, alternating      0% every turn  (above a size knee)
 
+Exits 1 when the arm reproduces the defect (a PREFIX-LOST turn), 0 when it does not. It
+exits 2 when it checked no turn. Round 1 is cold, so a run needs at least two rounds inside
+the budget. A clean arm is not a fix on its own: run the dense arm too. If that is also
+clean, the test failed to reproduce rather than the fix working.
+
 Usage:
     python bench/prefix_alternation.py --target-tokens 60000 --rounds 3
     python bench/prefix_alternation.py --target-tokens 96000 --noise 2 --rounds 4
@@ -33,21 +38,10 @@ import os
 import subprocess
 import sys
 import time
-import urllib.request
+
+import harness
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-
-
-def _key(path):  # same convention as quality_battery.py
-    try:
-        return open(path).read().strip()
-    except OSError:
-        return ""
-
-
-KEY = os.environ.get("VLLM_API_KEY") or _key(os.path.join(HERE, "..", "api_key.txt"))
-API = os.environ.get("VLLM_API", "http://127.0.0.1:18020/v1")
-MODEL = os.environ.get("VLLM_MODEL", "qwen3.8-27b")
 UNIT = os.environ.get("HQ_UNIT", "")
 
 LOG = []
@@ -67,12 +61,11 @@ def engine_block():
     except Exception:  # noqa: BLE001
         pass
     try:
-        base = API[: -len("/v1")] if API.endswith("/v1") else API
-        req = urllib.request.Request(base + "/metrics",
-                                     headers={"Authorization": "Bearer " + KEY})
-        text = urllib.request.urlopen(req, timeout=30).read().decode()
-        m = re.search(r'^vllm:cache_config_info\{[^}]*\bblock_size="(\d+)"', text, re.M)
-        return int(m.group(1)) if m else None
+        for name, labels, _ in harness.samples():
+            if name == "vllm:cache_config_info":
+                m = re.search(r'\bblock_size="(\d+)"', labels)
+                return int(m.group(1)) if m else None
+        return None
     except Exception:  # noqa: BLE001
         return None
 
@@ -85,16 +78,13 @@ def healthy_floor(prev_prompt, block):
 
 
 def call(messages, max_tokens=24):
-    body = json.dumps({
-        "model": MODEL, "messages": messages, "max_tokens": max_tokens,
+    payload = {
+        "messages": messages, "max_tokens": max_tokens,
         "temperature": 0,
         "chat_template_kwargs": {"enable_thinking": False},
-    }).encode()
-    req = urllib.request.Request(
-        API + "/chat/completions", data=body,
-        headers={"Authorization": "Bearer " + KEY, "Content-Type": "application/json"})
+    }
     t0 = time.time()
-    d = json.load(urllib.request.urlopen(req, timeout=1800))
+    d = harness.post("/v1/chat/completions", payload, timeout=1800)
     el = time.time() - t0
     u = d["usage"]
     det = u.get("prompt_tokens_details") or {}
@@ -146,7 +136,7 @@ def _engine_pid():
                     return pid
             except Exception:  # noqa: BLE001
                 pass
-    port = API.split("://", 1)[-1].split("/", 1)[0].rsplit(":", 1)[-1]
+    port = harness.base_url().split("://", 1)[-1].split("/", 1)[0].rsplit(":", 1)[-1]
     for pid in filter(str.isdigit, os.listdir("/proc")):
         try:
             argv = open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0")
@@ -292,6 +282,9 @@ def main():
             print(f"  r{r} {s}  previous prefix {pp:,} tok, reused {c:,} tok "
                   f"(short by {pp - c:,}, {sec:.1f}s)")
         print("\nthis arm REPRODUCES the defect.")
+    elif not stats["healthy"]:
+        print("\nINVALID: no turn was checked. Round 1 is cold, so run at least two")
+        print("   rounds inside --budget-min.")
     else:
         print("\n✅ no prefix loss: every turn reused the previous turn's whole prefix.")
         print("   ⚠️ This only says so for this arm. To claim a fix, run the dense")
@@ -301,7 +294,7 @@ def main():
         json.dump({"arm": tag, "args": vars(args), "stats": stats,
                    "elapsed_s": el, "log": LOG}, f, ensure_ascii=False, indent=1)
     print(f"\nraw records -> {out}")
-    return 0
+    return 1 if fail_rows else 0 if stats["healthy"] else 2
 
 
 if __name__ == "__main__":

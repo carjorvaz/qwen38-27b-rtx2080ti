@@ -21,11 +21,21 @@ Apply from the installed vllm package directory:
 
 Validated against vLLM 0.28.0; the same two hunks apply to 0.29.0 at an offset.
 
---- cut by hand against pristine v0.28.0 with patches/series applied, line numbers exact (not a cpuchip/vllm topic commit yet; import it there and re-export) ---
+Kind: fix
+What: the Marlin int8-activation path (`INT8_ACT=int8`) accepts zero-point `uint4` weights, so
+  asymmetric AWQ exports (compressed-tensors `symmetric: false`) run W4A8 like the symmetric ones;
+  the `kS8 x kU4` kernel is already compiled, only two asserts refused it
+Upstream: none yet
+Cut-against: 0.31.0
+Retires-when: upstream PR
 
+--- exported from 5a759da90 (marlin-int8-asym-zp); regenerate with scripts/export-patch.sh, do not edit ---
+
+diff --git a/model_executor/kernels/linear/mixed_precision/marlin.py b/model_executor/kernels/linear/mixed_precision/marlin.py
+index a3200a3d4..6b3f6e6ad 100644
 --- a/model_executor/kernels/linear/mixed_precision/marlin.py
 +++ b/model_executor/kernels/linear/mixed_precision/marlin.py
-@@ -143,7 +143,10 @@
+@@ -123,7 +123,10 @@
          is_a_8bit = c.act_type is not None and c.act_type.itemsize == 1
  
          if is_a_8bit:
@@ -37,9 +47,11 @@ Validated against vLLM 0.28.0; the same two hunks apply to 0.29.0 at an offset.
                  "W8A8 is not supported by marlin kernel."
              )
  
+diff --git a/model_executor/layers/quantization/utils/marlin_utils.py b/model_executor/layers/quantization/utils/marlin_utils.py
+index d28d8b8e1..1fb7e4ef7 100644
 --- a/model_executor/layers/quantization/utils/marlin_utils.py
 +++ b/model_executor/layers/quantization/utils/marlin_utils.py
-@@ -738,7 +738,9 @@
+@@ -789,7 +789,9 @@
  
      a_scales = None
      if input_dtype == torch.int8:
