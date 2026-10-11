@@ -1,12 +1,13 @@
 # Qwen3.8-27B on a 22 GB RTX 2080 Ti
 
 A fork of [syv-ai/HyperQwen](https://github.com/syv-ai/HyperQwen) that ports its
-vLLM 0.29.0 serving stack to Turing (SM75). One RTX 2080 Ti with 22 GB runs
+vLLM 0.31.0 serving stack to Turing (SM75). One RTX 2080 Ti with 22 GB runs
 Qwen3.8-27B at 262,144 tokens of context out of a 5.5 GiB int4 KV pool, with
 MTP speculative decoding, prefix caching and an int8 prefill path.
 
 Measured on that card at 280 W, single stream, on the vLLM 0.29.0 stack (V2
-runner, `VLLM_MTP_LOOKUP=1`, MTP k=4). Decode uses chat-shaped Wikitext-2
+runner, `VLLM_MTP_LOOKUP=1`, MTP k=4) — the tables below are those runs, not the
+0.31.0 pin yet. Decode uses chat-shaped Wikitext-2
 prompts, greedy sampling and 128 output tokens (`qwen38-sm75-bench
 --text-file`):
 
@@ -38,14 +39,16 @@ Quality with the int4 KV cache: 10.88 PPL on wikitext-2 and 94.8% on GSM8K
 
 `patches-turing/` is the port, applied after upstream's `patches/series`. Each
 patch carries its own measurements in its header. The
-[0.29.0 port notes](docs/turing-0.29-port.md) cover validation. The older
-0.28.0 results and patch-by-patch measurements are in
+[0.31.0 port notes](docs/turing-0.31-port.md) record the current sync (from the
+0.29.0 base through upstream's 0.30.0 and 0.31.0 ports); the tables above and the
+0.28.0 results with their patch-by-patch measurements are the older runs, in
+[0.29.0 port notes](docs/turing-0.29-port.md) and
 [docs/turing-2080ti.md](docs/turing-2080ti.md); optional prefill work is in
 [docs/turing-prefill.md](docs/turing-prefill.md).
 
 ## Running it
 
-Apply `patches/series` and then `patches-turing/series` to a vLLM 0.29.0
+Apply `patches/series` and then `patches-turing/series` to a vLLM 0.31.0
 checkout, both at `--fuzz 0` (`patches-turing/README.md` has the loop), then:
 
 ```bash
@@ -67,7 +70,7 @@ Optional prefill settings, all off by default:
     VLLM_TURING_EXTEND_MAX=32          split-KV path for short extensions
     VLLM_TURING_PREFILL_INT8=mlp       transient int8 GEMMs; +0.97% PPL
 
-The MTP history lookup is off by default and runs on both 0.29.0 runners
+The MTP history lookup is off by default and runs on both runners
 (`VLLM_MTP_LOOKUP=1`; on copy/edit work it drafts from the request's own
 history). Its own measurements and gates are in
 [docs/turing-2080ti.md](docs/turing-2080ti.md).

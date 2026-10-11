@@ -237,7 +237,7 @@ one-key prefix window followed by a query-sized causal window), an independent
 FP32 attention reference, noncontiguous outputs with canaries, sign generation
 under a FP16 default dtype, negative weight scales, immutable canonical weights,
 compilation hashes, and dynamic-M CUDA-graph execution. A full GNU-patch pass
-against pristine vLLM 0.29.0 is also required.
+against pristine vLLM 0.31.0 is also required.
 
 ## Investigated but not enabled
 

@@ -1,12 +1,13 @@
 # Turing (SM75): Qwen3.8-27B on a 22 GB RTX 2080 Ti
 
 This branch adds a Turing port to the 3090 stack. `patches-turing/` is a
-22-patch series applied after upstream's `patches/series`, on the same
-vLLM 0.29.0 pin, and it runs the same serving setup on a card that is 8 GB
+21-patch series applied after upstream's `patches/series`, on the same
+vLLM 0.31.0 pin, and it runs the same serving setup on a card that is 8 GB
 smaller and one generation older: an RTX 2080 Ti with 22 GB, running at 280 W
-(the card's factory cap is 250 W). The 0.29.0 rebase and its validation are
-recorded in [turing-0.29-port.md](turing-0.29-port.md): quality is unchanged on
-0.29.0 (PPL 10.88, GSM8K 95.5%) and decode is equal or better; the per-context
+(the card's factory cap is 250 W). The current sync is recorded in
+[turing-0.31-port.md](turing-0.31-port.md) and the 0.29.0 rebase in
+[turing-0.29-port.md](turing-0.29-port.md): quality was unchanged on
+0.29.0 (PPL 10.88, GSM8K 95.5%) and decode equal or better; the per-context
 tables below remain the 0.28.0 measurements.
 
 The short version: 262,144 tokens of context out of a 5.5 GiB int4 KV pool,
@@ -79,7 +80,7 @@ references, plus timing).
 
 ## Running it
 
-Install vLLM 0.29.0, apply both patch directories in their `series` order
+Install vLLM 0.31.0, apply both patch directories in their `series` order
 (`patches-turing/README.md` has the command), and launch with the flags this
 was measured with:
 
@@ -99,7 +100,7 @@ vllm serve models/Qwen3.8-27B-W4A16-AutoRound \
 
 `--kv-cache-memory 5905580032` is the whole budget the card has for KV at this
 context: raise it for a longer context, lower it if the model does not load.
-The MTP history lookup runs on both vLLM 0.29.0 runners (`mtp-history-lookup`
+The MTP history lookup runs on both runners (`mtp-history-lookup`
 in the V1 proposer, `mtp-lookup-v2` in the V2 MTPSpeculator), so the V2 default
 is fine; `VLLM_USE_V2_MODEL_RUNNER=0` is only for comparing against V1.
 `--load-format runai_streamer` with `--model-loader-extra-config
@@ -256,7 +257,7 @@ Kept here so nobody re-derives them:
   streams needs a second KV pool, about 5.97 GiB beyond what the card has spare
   at 262k.
 - The Docker and compose paths in this repo build for the 3090's CUDA arch
-  list; they are not wired for Turing. Apply the series to a local vLLM 0.29.0
+  list; they are not wired for Turing. Apply the series to a local vLLM 0.31.0
   environment instead.
 - The int4 3D-scratch attention variant boots but is not faster here; its
   workspace is capped so a large block cannot over-allocate.
@@ -270,5 +271,5 @@ Kept here so nobody re-derives them:
 
 Fork of [syv-ai/HyperQwen](https://github.com/syv-ai/HyperQwen) (formerly
 `syv-ai/qwen38-27b-rtx3090`), whose 3090 stack, preparation scripts and
-benchmark harness this series builds on and does not replace. The patches here modify vLLM 0.29.0; both are
+benchmark harness this series builds on and does not replace. The patches here modify vLLM 0.31.0; both are
 Apache-2.0, see `LICENSE`.
