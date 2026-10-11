@@ -30,11 +30,11 @@ def main():
     torch.manual_seed(1729)
     for k, n in ((512, 512), (1024, 1536)):
         w = torch.randn(k, n, device="cuda", dtype=torch.float16) / k**0.5
-        ref, w16, s16, idx, sort, _ = marlin_quantize(
-            w, scalar_types.uint4b8, 128, False
-        )
-        _, w8, _, _, _, _ = marlin_quantize(
-            w, scalar_types.uint4b8, 128, False, input_dtype=torch.int8
+        # 0.31's marlin_quantize lost act_order/test_perm and returns
+        # (w_ref, marlin_q_w, marlin_s).
+        ref, w16, s16 = marlin_quantize(w, scalar_types.uint4b8, 128)
+        _, w8, _ = marlin_quantize(
+            w, scalar_types.uint4b8, 128, input_dtype=torch.int8
         )
         assert torch.equal(repack(w16, s16)[0], w8), "different positive-scale packing"
         workspace = MarlinWorkspace(n, 64, 16).scratch
@@ -53,13 +53,10 @@ def main():
                     w16,
                     s16,
                     empty,
-                    idx,
-                    sort,
                     workspace,
                     scalar_types.uint4b8,
                     n,
                     k,
-                    True,
                 )
                 y = run(prefill_int8=True)
                 if m < 1024:
@@ -78,13 +75,10 @@ def main():
             w16,
             s16,
             empty,
-            idx,
-            sort,
             workspace,
             scalar_types.uint4b8,
             n,
             k,
-            True,
             prefill_int8=True,
         )
 
@@ -110,13 +104,10 @@ def main():
             w16,
             s16,
             empty,
-            idx,
-            sort,
             workspace,
             scalar_types.uint4b8,
             n,
             k,
-            True,
         )
         assert torch.equal(captured, expected), "compiled/captured decode changed"
     print(

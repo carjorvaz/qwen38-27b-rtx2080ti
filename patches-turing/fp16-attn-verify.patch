@@ -111,7 +111,7 @@ index cde2e4c..9639247 100644
          unified_attention(
              q=query[:num_actual_tokens],
 diff --git a/v1/attention/ops/spec_decode_attn.py b/v1/attention/ops/spec_decode_attn.py
-index 9fe6e48..9cb3301 100644
+index 9fe6e48..0a27dc9 100644
 --- a/v1/attention/ops/spec_decode_attn.py
 +++ b/v1/attention/ops/spec_decode_attn.py
 @@ -30,8 +30,8 @@
@@ -162,7 +162,29 @@ index 9fe6e48..9cb3301 100644
          m_i = m_new
  
      # store partials at flat index ((req*Hq + head)*QMAX + i)*NSEG + seg
-@@ -230,9 +233,11 @@
+@@ -204,6 +207,12 @@
+         self.num_heads = num_heads
+         self.head_dim = head_dim
+         self.device = device
++        # What the Triton verify attention can launch is decided by the
++        # per-block shared memory: sm75 has 64 KiB, where Ampere's 99 KiB tile
++        # does not fit at D=256 (the tile is halved below, and the size that
++        # did is remembered).
++        properties = torch.cuda.get_device_properties(device)
++        self.small_shared_memory = properties.shared_memory_per_block_optin < 98304
+         n = max_num_reqs * num_heads * qmax * self.nseg
+         self.part_o = torch.empty(n, head_dim, dtype=torch.float32, device=device)
+         self.part_m = torch.empty(n, dtype=torch.float32, device=device)
+@@ -222,6 +231,8 @@
+             block_m = 64
+         else:
+             block_m = BLOCK_M_BIG
++        if self.small_shared_memory and D == 256:
++            block_m = min(block_m, 32)
+         block_m = max(block_m, G if G > 1 else 1)
+         block_m = 1 << (block_m - 1).bit_length()
+         qt = max(1, block_m // G)
+@@ -230,9 +241,11 @@
      def run(self, q, key_cache, value_cache, out, cu_seqlens_q, seqused_k, block_table, scale,
              num_reqs, max_query_len, k_scale_cache=None, v_scale_cache=None,
              k_descale=None, v_descale=None, q_descale=None):
@@ -177,6 +199,15 @@ index 9fe6e48..9cb3301 100644
          Hq, D = q.shape[1], q.shape[2]
          Hkv = key_cache.shape[2]
          G = Hq // Hkv
+@@ -250,6 +263,8 @@
+         # that does not launch is halved below, and the size that did is remembered.
+         block_m, qt, ntile, warps = self._plan(max_query_len, G, D)
+         tile = 64 if (block_m <= 32 or D <= 128) else 32
++        if self.small_shared_memory and D == 256:
++            tile = 32
+         fit = (q.device, block_m, D, key_cache.dtype)
+         tile = _TILE_FITS.get(fit, tile)
+         if envs.VLLM_SPEC_ATTN_DEBUG:
 diff --git a/v1/attention/ops/turing_prefill_attn.py b/v1/attention/ops/turing_prefill_attn.py
 new file mode 100644
 index 0000000..ec9ebd1
