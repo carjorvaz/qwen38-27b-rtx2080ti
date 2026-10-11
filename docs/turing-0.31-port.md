@@ -59,10 +59,52 @@ this series against the 0.29.0 and 0.31.0 tags:
 
 **Syntax.** All 76 Python files the series changes compile under Python 3.12.
 
-**Not yet verified.** Everything that needs the card: the CUDA kernels compiling
-(`turing_spec_attn.cu`, `turing_prefill_attn.cu`, the GDN kernels), the kernel
-suites (`test_turing_gdn.py`, `test_turing_prefill.py`, `test_turing_marlin.py`),
-the packaged regressions (`qwen38-sm75-check attention|prefill|prefix|gdn|
-downloads`), quality (PPL / GSM8K), and the benchmark tables. The README and
-`docs/turing-2080ti.md` tables remain the 0.29.0 runs until a re-run on this
-pin replaces them.
+## Validated on the card (2026-10-11, tiberius, RTX 2080 Ti)
+
+The runtime was built from this revision (`qwen38-sm75-prepare`), and the
+packaged regressions and kernel suites ran with the GPU to themselves:
+
+| gate | result |
+| --- | --- |
+| `check attention` | PASS (FP16/INT8/INT4 reference and live graphs, packed int4, native selector JIT) |
+| `check prefill` | PASS (all dtypes, the 262144-token case, tiles regression, graph replay) |
+| `check prefix` | PASS (scheduler boundaries, allocator + lookup + COW, `CACHE_CPU_REGRESSION_PASS`) |
+| `check gdn`, `check downloads` | PASS |
+| `test_turing_gdn` | PASS (chunk state/output parity, escape hatches; 3.8x / 10x over the reference) |
+| `test_turing_prefill` | PASS (94 comparisons) |
+| `test_turing_marlin` | PASS (packing, negative scales, compile hash, dynamic-M compile, graph bit-equality) |
+
+The first run of the port found two things the offline checks could not:
+
+- `check attention` died in the Triton verify attention with `OutOfResources`
+  (Required 81920, limit 65536). Upstream's `spec-attn-smem-fit` only halves
+  the KV tile, and `_plan` can still pick `BLOCK_M=128` at D=256, whose 64 KiB
+  query tile never fits sm75 however far the tile halves. The series' own
+  `small_shared_memory` guard (the probe, the `BLOCK_M` clamp and the initial
+  `TILE=32`) is load-bearing and is restored in `fp16-attn-verify`; it is also
+  what routes the sm75/D256 shapes to the native kernel at all.
+- The engine failed to load the model with
+  `ModuleNotFoundError: runai_model_streamer`: the deployment loads with
+  `--load-format runai_streamer`, and 0.31 lists that package only in
+  `requirements/rocm.txt`. `requirements.lock` (the package's own artifact)
+  carries `runai-model-streamer==0.16.1` with its `humanize` dependency.
+
+Live-behaviour probes on the served model:
+
+- Prompts of 1632 / 1633 / 1634 / 1636 / 3265 tokens all complete in about a
+  second. The lookahead-window deferral upstream documents is not reachable in
+  this configuration: without the Eagle block drop, the block-aligned split
+  does not cap a chunk inside the draft window.
+- `qwen38-sm75-bench --text-file`, greedy, 128 tokens: **98.0-100.0 / 96.1 /
+  76.8 tok/s** at 8k / 32k / 64k (acceptance 3.54 / 3.74 / 3.31; TTFT 0.2-6.0 /
+  27.2 / 44.6 s) against the 0.29 record's 112.4 / 99.8 / 80.6 (acceptance
+  3.97 / 3.97 / 3.54). The 8k cell is ~12% down and the gap tracks acceptance,
+  not step time; the mid and long cells are within 4-5%. That is a drafting
+  follow-up (MTP acceptance on this text), not a kernel one.
+- Quality is unchanged: PPL en 10.8097 / da 10.942 against 10.8096 / 10.9401,
+  and GSM8K 96.0% (n=200, mean 381 tokens) against 95.5%.
+
+**Not yet re-measured.** The remaining README and `docs/turing-2080ti.md` cells
+(2k, 128k, 253k decode; the prefill tails; the copy/edit acceptance) still come
+from the 0.29.0 runs.
+

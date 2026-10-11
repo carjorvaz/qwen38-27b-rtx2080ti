@@ -11,7 +11,7 @@ runner, `VLLM_MTP_LOOKUP=1`, MTP k=4) — the tables below are those runs, not t
 prompts, greedy sampling and 128 output tokens (`qwen38-sm75-bench
 --text-file`):
 
-Decode:
+Decode (0.29.0 stack):
 
 | context | tok/s |
 | ---: | ---: |
@@ -21,6 +21,13 @@ Decode:
 | 64k | 80.6 |
 | 128k | 80.4 |
 | 253k | 51.6 |
+
+Decode on the current **0.31.0** pin, same instrument (greedy, 128 tokens,
+acceptance in brackets): 8k **98.0-100.0** [3.54], 32k **96.1** [3.74], 64k
+**76.8** [3.31]. The 8k gap against 0.29's 112.4 [3.97] tracks acceptance
+rather than step time, so it is a drafting follow-up; the mid and long cells
+are within 4-5%. PPL and GSM8K are unchanged (10.81/10.94 and 96.0% n=200).
+[docs/turing-0.31-port.md](docs/turing-0.31-port.md) has the full run.
 
 Tail prefill, extending an existing session by 2048 tokens
 (`bench/turing_api_bench.py --corpus wikitext --tails 2048`):
