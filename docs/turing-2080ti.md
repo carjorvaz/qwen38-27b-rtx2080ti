@@ -48,7 +48,7 @@ otherwise produces wrong results or does not run.
 | `gdn-chunk-state` | chunked gated-delta-rule state update for SM75 | correctness on Turing |
 | `spec-decode-mma` | the verify attention kernel: fp16 MMA, split-KV, in-kernel dequant | the speculative path runs on Turing |
 | `mtp-history-lookup` | drafts from the context when the tail is already in it | 60k "reproduce this" 78.4 -> 90 tok/s, exact |
-| `mtp-prefix-checkpoint` | checkpoints recurrent state where prefix caching matched | correctness (prefix caching with a hybrid model) |
+| `mtp-prefix-checkpoint` | checkpoints recurrent state where prefix caching matched | correctness (prefix caching with a hybrid model); **retired at the 0.31 port** — upstream 0.31 owns this now |
 | `packed-int4-kv` | asymmetric int4 KV, per-(token, head) zero points | 262k context in 5.5 GiB |
 | `prefill-attn-dispatch` | keeps short prefills off the decode graph | correctness (recurrent-state init) |
 | `prefill-attn-tiles` | the SM75 tile kernel, constants measured | tail prefill 464 tok/s at 64k, 240 at 248k |
@@ -70,8 +70,11 @@ Four 0.28-era patches left the series at the 0.29 port because upstream carries
 them now: `mamba-block-retirement` (upstream's
 `mamba-align-retire-null-gaps.patch`, the same vLLM #55450 backport), the
 engine completion and stall-sentinel backports, and SSE keep-alive (native in
-vLLM 0.29.0). The tail patch `envs-knobs` registers the knobs below in
-`envs.py`; [turing-0.29-port.md](turing-0.29-port.md) has the details.
+vLLM 0.29.0). One more left at the 0.31.0 port: `mtp-prefix-checkpoint`, whose
+checkpoint alignment upstream now implements itself. The tail patch
+`envs-knobs` registers the knobs below in
+`envs.py`; [turing-0.29-port.md](turing-0.29-port.md) and
+[turing-0.31-port.md](turing-0.31-port.md) have the details.
 
 Standalone GPU tests cover the native kernels, with no model and no server:
 `python bench/test_turing_prefill.py`, `bench/test_turing_marlin.py`, and
