@@ -95,21 +95,22 @@ Live-behaviour probes on the served model:
   second. The lookahead-window deferral upstream documents is not reachable in
   this configuration: without the Eagle block drop, the block-aligned split
   does not cap a chunk inside the draft window.
-- `qwen38-sm75-bench --text-file`, greedy, 128 tokens: **98.0-113.0 / 96.1 /
-  76.8 tok/s** at 8k / 32k / 64k (acceptance 3.54-3.85 / 3.74 / 3.31; TTFT
-  0.2-6.0 / 27.2 / 44.6 s) and **113.7-117.6** [3.85-3.98] at 2k. The 0.29
-  runtime, measured the same day with the same client, file and flags, gives 2k
-  109.7 [3.79] and 8k 96-97 [3.40] — at or below this pin in every cell — and one
-  0.31 boot reproduces the 0.29 record's 112.4 at 8k (acceptance 3.848). Step
-  time is at parity with 0.29 (27.7 against 28.6 ms at 8k). The README's 0.29
-  column is a session, not a target: its 3.97 acceptance at 8k is not
-  reproducible on 0.29 today either, acceptance moves ~9% between boots at one
-  cell (3.541 and 3.848 here), and the copy probe reads 3.59 on both runtimes
-  against the record's 4.19-4.22. The transient W4A8 prefill is not the
-  difference either: with `VLLM_TURING_PREFILL_INT8=off` the same 8k cell reads
-  3.25, lower than with it on (3.848). Nothing here is a kernel or drafting
-  regression; the remaining README cells (128k, 253k decode; the prefill tails;
-  the copy/edit acceptance) are the 0.29.0 runs and need their own session.
+- `qwen38-sm75-bench --text-file`, greedy, 128 tokens, production procedure:
+  **122.1 / 98.9 / 95.5 / 81.1 tok/s** at 2k / 8k / 32k / 64k (acceptance 4.097 /
+  3.541 / 3.657 / 3.459; TTFT 1.6 / 5.9 / 26.7 / 44.0 s). The same-day A/B, same
+  client (byte-identical to the September package), file and flags: 0.31 reads 2k
+  117.6 [3.98] and 8k 113.0/110.9 [3.848], the 0.29 runtime 2k 109.7 [3.794] and
+  8k 97.0/95.8 [3.395], and the copy probe 3.59 on both — this pin at or above
+  0.29 in every cell, with step time at parity (27.7 against 28.6 ms at 8k).
+  Acceptance tracks the measurement state, not the pin: the same 8k cell reads
+  3.541 under the production procedure and 3.848 with a warmed prefix ahead of it
+  (the A/B's procedure), stably within each. The README's 0.29 column is the
+  2026-09-24 session and its 112.4 / 3.97 is not reproduced by any procedure tried
+  here, on either runtime. The transient W4A8 prefill is not the difference:
+  the only same-procedure pair measured (`VLLM_TURING_PREFILL_INT8=off` against
+  on, fresh boots) reads 3.25 against 3.848, i.e. the wrong way for that theory,
+  and stays flagged as unexplained. The remaining README cells (128k, 253k
+  decode; the prefill tails; the copy/edit acceptance) are the 0.29.0 runs.
 - Quality is unchanged: PPL en 10.8097 / da 10.942 against 10.8096 / 10.9401,
   and GSM8K 96.0% (n=200, mean 381 tokens) against 95.5%.
 
