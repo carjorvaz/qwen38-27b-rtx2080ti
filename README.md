@@ -23,15 +23,15 @@ Decode (0.29.0 stack):
 | 253k | 51.6 |
 
 Decode on the current **0.31.0** pin, production procedure (greedy, 128 tokens,
-acceptance in brackets): 2k **122.1** [4.10], 8k **98.9** [3.54], 32k **95.5**
-[3.66], 64k **81.1** [3.46]. The 0.29 column above is the 2026-09-24 session; the
-same-day A/B (same client — byte-identical to the September package — same file
-and flags) puts this pin at or above the 0.29 runtime in every cell: 2k 117.6
-against 109.7, 8k 113.0/110.9 against 97.0/95.8 (acceptance 3.85 against 3.40),
-copy 3.59 on both. Acceptance tracks the measurement state, not the pin — the
-same 8k cell reads 3.54 without a warmed prefix and 3.85 with one, stably within
-each procedure — so compare cells within a procedure. PPL and GSM8K are
-unchanged (10.81/10.94 and 96.0% n=200).
+acceptance in brackets): 2k **121.8-122.1** [4.10], 8k **98.1-110.0**
+[3.54-3.85], 32k **95.1-95.5** [3.66], 64k **80.5-81.1** [3.46]. The 8k spread is
+the pass, not the pin: the first pass at a cell reads lower than a repeat in the
+same boot (8k 98.1/3.541, then 110.0/3.848), with or without the unit's warmup
+service. The 0.29 column above is the 2026-09-24 session; the same-day A/B (same
+client — byte-identical to the September package — same file and flags) puts this
+pin at or above the 0.29 runtime in every cell and pass state: 2k 117.6 against
+109.7, 8k 113.0/110.9 against 97.0/95.8 (acceptance 3.85 against 3.40), copy 3.59
+on both. PPL and GSM8K are unchanged (10.81/10.94 and 96.0% n=200).
 [docs/turing-0.31-port.md](docs/turing-0.31-port.md) has the record.
 
 Tail prefill, extending an existing session by 2048 tokens
