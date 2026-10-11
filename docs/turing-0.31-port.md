@@ -95,16 +95,24 @@ Live-behaviour probes on the served model:
   second. The lookahead-window deferral upstream documents is not reachable in
   this configuration: without the Eagle block drop, the block-aligned split
   does not cap a chunk inside the draft window.
-- `qwen38-sm75-bench --text-file`, greedy, 128 tokens: **98.0-100.0 / 96.1 /
-  76.8 tok/s** at 8k / 32k / 64k (acceptance 3.54 / 3.74 / 3.31; TTFT 0.2-6.0 /
-  27.2 / 44.6 s) against the 0.29 record's 112.4 / 99.8 / 80.6 (acceptance
-  3.97 / 3.97 / 3.54). The 8k cell is ~12% down and the gap tracks acceptance,
-  not step time; the mid and long cells are within 4-5%. That is a drafting
-  follow-up (MTP acceptance on this text), not a kernel one.
+- `qwen38-sm75-bench --text-file`, greedy, 128 tokens: **98.0-113.0 / 96.1 /
+  76.8 tok/s** at 8k / 32k / 64k (acceptance 3.54-3.85 / 3.74 / 3.31; TTFT
+  0.2-6.0 / 27.2 / 44.6 s) and **113.7-117.6** [3.85-3.98] at 2k. The 0.29
+  runtime, measured the same day with the same client, file and flags, gives 2k
+  109.7 [3.79] and 8k 96-97 [3.40] — at or below this pin in every cell — and one
+  0.31 boot reproduces the 0.29 record's 112.4 at 8k (acceptance 3.848). Step
+  time is at parity with 0.29 (27.7 against 28.6 ms at 8k). The README's 0.29
+  column is a session, not a target: its 3.97 acceptance at 8k is not
+  reproducible on 0.29 today either, acceptance moves ~9% between boots at one
+  cell (3.541 and 3.848 here), and the copy probe reads 3.59 on both runtimes
+  against the record's 4.19-4.22. The transient W4A8 prefill is not the
+  difference either: with `VLLM_TURING_PREFILL_INT8=off` the same 8k cell reads
+  3.25, lower than with it on (3.848). Nothing here is a kernel or drafting
+  regression; the remaining README cells (128k, 253k decode; the prefill tails;
+  the copy/edit acceptance) are the 0.29.0 runs and need their own session.
 - Quality is unchanged: PPL en 10.8097 / da 10.942 against 10.8096 / 10.9401,
   and GSM8K 96.0% (n=200, mean 381 tokens) against 95.5%.
 
-**Not yet re-measured.** The remaining README and `docs/turing-2080ti.md` cells
-(2k, 128k, 253k decode; the prefill tails; the copy/edit acceptance) still come
-from the 0.29.0 runs.
+**Not yet re-measured.** 128k and 253k decode, the prefill tails, and the
+copy/edit acceptance — those cells stay the 0.29.0 runs.
 
