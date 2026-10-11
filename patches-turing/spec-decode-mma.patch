@@ -7,20 +7,21 @@ kernel. Wired into the TRITON_ATTN and FLASH_ATTN paths that the MTP drafter and
 the forward pass use.
 
 diff --git a/v1/attention/backends/flash_attn.py b/v1/attention/backends/flash_attn.py
-index d4486fb..7dabed2 100755
+index 83c0c49..17b035c 100755
 --- a/v1/attention/backends/flash_attn.py
 +++ b/v1/attention/backends/flash_attn.py
-@@ -928,6 +928,9 @@ class FlashAttentionImpl(AttentionImpl):
-             )
+@@ -1209,6 +1209,10 @@
+             not uses_sm90_fa4_fp8_kv_dequant
+         )
  
-         self.supports_quant_query_input = flash_attn_supports_quant_query_input()
 +        self._spec_attn_max_reqs = (
 +            vllm_config.scheduler_config.max_num_seqs if vllm_config is not None else None
 +        )
- 
++
          dcp_a2a = (
              vllm_config is not None
-@@ -1946,23 +1949,20 @@ def _spec_attn_qmax(group: int) -> int:
+             and vllm_config.parallel_config.decode_context_parallel_size > 1
+@@ -2238,23 +2242,20 @@
  def _spec_attn_run(impl, q, key_cache, value_cache, out, cu_seqlens_q, seqused_k, block_table, max_seqlen_q, k_scale_cache=None, v_scale_cache=None):
      from vllm.v1.attention.ops.spec_decode_attn import SpecDecodeAttention
  
@@ -51,10 +52,10 @@ index d4486fb..7dabed2 100755
  
  
 diff --git a/v1/attention/backends/triton_attn.py b/v1/attention/backends/triton_attn.py
-index dd3491c..28bf881 100644
+index 9639247..c64c90a 100644
 --- a/v1/attention/backends/triton_attn.py
 +++ b/v1/attention/backends/triton_attn.py
-@@ -730,6 +730,9 @@ class TritonAttentionImpl(AttentionImpl):
+@@ -734,6 +734,9 @@
          # without a current config (unit tests), there is nothing to size from
          # and the builder allocates, unaccounted, as before.
          vllm_config = get_current_vllm_config_or_none()
@@ -65,7 +66,7 @@ index dd3491c..28bf881 100644
              mq3d_scratch_acquire(
                  mq3d_scratch_plan(vllm_config, num_heads),
 diff --git a/v1/attention/ops/spec_decode_attn.py b/v1/attention/ops/spec_decode_attn.py
-index cbeb960..506ac5d 100644
+index 9cb3301..5181157 100644
 --- a/v1/attention/ops/spec_decode_attn.py
 +++ b/v1/attention/ops/spec_decode_attn.py
 @@ -1,11 +1,11 @@
@@ -82,7 +83,7 @@ index cbeb960..506ac5d 100644
  computing an online-softmax partial over its slice of the KV cache for all its query
  rows at once (G = query heads per kv head), followed by a tiny combine kernel.
  
-@@ -15,6 +15,10 @@ made lookup-augmented drafting unaffordable past a block of 7 -- a 16-token veri
+@@ -15,6 +15,10 @@
  back to FA2 and doubled the step at 25k context. Each tile re-reads the KV segment, so
  BLOCK_M is chosen to keep the tile count at 1 where the register budget allows.
  
@@ -93,7 +94,7 @@ index cbeb960..506ac5d 100644
  Layout matches vLLM's FLASH_ATTN backend: q [T, Hq, D], key/value cache
  [num_blocks, block_size, Hkv, D] (block_size any multiple of 16), block_table
  [num_reqs, max_blocks], seqused_k [num_reqs] = kv length including the new tokens,
-@@ -192,20 +196,26 @@ class SpecDecodeAttention:
+@@ -197,16 +201,25 @@
      """Holds the partial buffers; call .run(...) per layer."""
  
      def __init__(self, max_num_reqs, num_heads, head_dim, device, qmax,
@@ -108,12 +109,7 @@ index cbeb960..506ac5d 100644
          self.num_heads = num_heads
          self.head_dim = head_dim
          self.device = device
--        self.small_shared_memory = (
--            torch.cuda.get_device_properties(device).shared_memory_per_block_optin
--            < 98304
--        )
 +        properties = torch.cuda.get_device_properties(device)
-+        self.small_shared_memory = properties.shared_memory_per_block_optin < 98304
 +        self.turing_partial = None
 +        if head_dim == 256 and (properties.major, properties.minor) == (7, 5):
 +            from vllm.v1.attention.ops.turing_spec_attn import load_turing_partial
@@ -126,26 +122,34 @@ index cbeb960..506ac5d 100644
          n = max_num_reqs * num_heads * qmax * self.nseg
          self.part_o = torch.empty(n, head_dim, dtype=torch.float32, device=device)
          self.part_m = torch.empty(n, dtype=torch.float32, device=device)
-@@ -268,22 +278,34 @@ class SpecDecodeAttention:
+@@ -269,30 +282,42 @@
                        f"num_reqs={num_reqs} qlen={max_query_len} plan block_m={block_m} qt={qt} ntile={ntile} warps={warps} tile={tile} nseg={self.nseg} "
                        f"seqused={seqused_k[:num_reqs].tolist()}", flush=True)
                  self._dbg_t0 = _t0
 -        grid = (num_reqs * ntile, Hkv, self.nseg)
--        _spec_attn_partial[grid](
--            q, key_cache, value_cache, block_table, seqused_k, cu_seqlens_q,
--            self.part_o, self.part_m, self.part_l,
--            k_scale_cache, v_scale_cache, k_descale, v_descale, q_descale,
--            scale,
--            q.stride(0), q.stride(1),
--            key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),
--            value_cache.stride(0), value_cache.stride(1), value_cache.stride(2),
--            block_table.stride(0),
--            *(k_scale_cache.stride() if quant else (0, 0, 0)),
--            *(v_scale_cache.stride() if quant else (0, 0, 0)),
--            G=G, Hq=Hq, QMAX=self.qmax, D=D, BLOCK_SIZE=key_cache.shape[1], BLOCK_M=block_m,
--            TILE=tile, NSEG=self.nseg, QT=qt, NTILE=ntile, QUANT=quant, FP8=fp8, Q_FP8=q_fp8,
--            num_warps=warps, num_stages=1,
--        )
+-        while True:
+-            try:
+-                _spec_attn_partial[grid](
+-                    q, key_cache, value_cache, block_table, seqused_k, cu_seqlens_q,
+-                    self.part_o, self.part_m, self.part_l,
+-                    k_scale_cache, v_scale_cache, k_descale, v_descale, q_descale,
+-                    scale,
+-                    q.stride(0), q.stride(1),
+-                    key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),
+-                    value_cache.stride(0), value_cache.stride(1), value_cache.stride(2),
+-                    block_table.stride(0),
+-                    *(k_scale_cache.stride() if quant else (0, 0, 0)),
+-                    *(v_scale_cache.stride() if quant else (0, 0, 0)),
+-                    G=G, Hq=Hq, QMAX=self.qmax, D=D, BLOCK_SIZE=key_cache.shape[1], BLOCK_M=block_m,
+-                    TILE=tile, NSEG=self.nseg, QT=qt, NTILE=ntile, QUANT=quant, FP8=fp8, Q_FP8=q_fp8,
+-                    num_warps=warps, num_stages=1,
+-                )
+-                break
+-            except OutOfResources:
+-                if tile <= 16:
+-                    raise
+-                tile //= 2
+-        _TILE_FITS[fit] = tile
 +        if (
 +            self.turing_partial is not None
 +            and q.dtype == torch.float16
@@ -159,21 +163,29 @@ index cbeb960..506ac5d 100644
 +            )
 +        else:
 +            grid = (num_reqs * ntile, Hkv, self.nseg)
-+            _spec_attn_partial[grid](
-+                q, key_cache, value_cache, block_table, seqused_k, cu_seqlens_q,
-+                self.part_o, self.part_m, self.part_l,
-+                k_scale_cache, v_scale_cache, k_descale, v_descale, q_descale,
-+                scale,
-+                q.stride(0), q.stride(1),
-+                key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),
-+                value_cache.stride(0), value_cache.stride(1), value_cache.stride(2),
-+                block_table.stride(0),
-+                *(k_scale_cache.stride() if quant else (0, 0, 0)),
-+                *(v_scale_cache.stride() if quant else (0, 0, 0)),
-+                G=G, Hq=Hq, QMAX=self.qmax, D=D, BLOCK_SIZE=key_cache.shape[1], BLOCK_M=block_m,
-+                TILE=tile, NSEG=self.nseg, QT=qt, NTILE=ntile, QUANT=quant, FP8=fp8, Q_FP8=q_fp8,
-+                num_warps=warps, num_stages=1,
-+            )
++            while True:
++                try:
++                    _spec_attn_partial[grid](
++                        q, key_cache, value_cache, block_table, seqused_k, cu_seqlens_q,
++                        self.part_o, self.part_m, self.part_l,
++                        k_scale_cache, v_scale_cache, k_descale, v_descale, q_descale,
++                        scale,
++                        q.stride(0), q.stride(1),
++                        key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),
++                        value_cache.stride(0), value_cache.stride(1), value_cache.stride(2),
++                        block_table.stride(0),
++                        *(k_scale_cache.stride() if quant else (0, 0, 0)),
++                        *(v_scale_cache.stride() if quant else (0, 0, 0)),
++                        G=G, Hq=Hq, QMAX=self.qmax, D=D, BLOCK_SIZE=key_cache.shape[1], BLOCK_M=block_m,
++                        TILE=tile, NSEG=self.nseg, QT=qt, NTILE=ntile, QUANT=quant, FP8=fp8, Q_FP8=q_fp8,
++                        num_warps=warps, num_stages=1,
++                    )
++                    break
++                except OutOfResources:
++                    if tile <= 16:
++                        raise
++                    tile //= 2
++            _TILE_FITS[fit] = tile
          _spec_attn_combine[(num_reqs, Hq, max_query_len)](
              self.part_o, self.part_m, self.part_l, out, cu_seqlens_q,
              out.stride(0), out.stride(1),

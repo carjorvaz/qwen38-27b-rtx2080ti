@@ -21,7 +21,7 @@ sampled lookup opt-in, with the NMAX=64 gate for copy-heavy traffic.
 `NMIN`/`NMAX`/`SEARCH` bound the search.
 
 diff --git a/v1/spec_decode/llm_base_proposer.py b/v1/spec_decode/llm_base_proposer.py
-index 93c19a4..f8097d4 100644
+index ff7de5b..26b0654 100644
 --- a/v1/spec_decode/llm_base_proposer.py
 +++ b/v1/spec_decode/llm_base_proposer.py
 @@ -1,6 +1,7 @@
@@ -32,7 +32,7 @@ index 93c19a4..f8097d4 100644
  from importlib.util import find_spec
  from typing import TYPE_CHECKING, Any, cast
  
-@@ -24,6 +25,34 @@ from vllm.distributed.eplb.eplb_state import EplbState
+@@ -23,6 +24,34 @@
  from vllm.distributed.parallel_state import get_pp_group
  from vllm.forward_context import set_forward_context
  from vllm.logger import init_logger
@@ -66,8 +66,8 @@ index 93c19a4..f8097d4 100644
 +
  from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
  from vllm.model_executor.model_loader import get_model
- from vllm.model_executor.models import (
-@@ -82,6 +111,27 @@ class SpecDecodeBaseProposer:
+ from vllm.model_executor.model_loader.utils import get_draft_load_config
+@@ -82,6 +111,27 @@
          self.speculative_config = vllm_config.speculative_config
          self.draft_model_config = self.speculative_config.draft_model_config
          self.method = self.speculative_config.method
@@ -95,7 +95,7 @@ index 93c19a4..f8097d4 100644
          self.pass_hidden_states_to_model = pass_hidden_states_to_model
          self._share_mtp_indices = False
  
-@@ -505,6 +555,168 @@ class SpecDecodeBaseProposer:
+@@ -506,6 +556,168 @@
              )
          return draft_token_ids, draft_probs
  
@@ -264,7 +264,7 @@ index 93c19a4..f8097d4 100644
      def take_last_draft_probs(self) -> torch.Tensor | None:
          return self._last_draft_probs
  
-@@ -531,6 +743,10 @@ class SpecDecodeBaseProposer:
+@@ -532,6 +744,10 @@
          self.num_speculative_tokens = num_speculative_tokens
          self._last_draft_probs = None
          batch_size = common_attn_metadata.batch_size()
@@ -279,7 +279,7 @@ diff --git a/v1/worker/gpu/spec_decode/dflash2/lookup.py b/v1/worker/gpu/spec_de
 index 0315b6e..901d3c6 100644
 --- a/v1/worker/gpu/spec_decode/dflash2/lookup.py
 +++ b/v1/worker/gpu/spec_decode/dflash2/lookup.py
-@@ -47,6 +47,7 @@ def _suffix_lookup_kernel(
+@@ -47,6 +47,7 @@
      out_len_ptr,
      out_valid_ptr,
      search_max,
@@ -287,7 +287,7 @@ index 0315b6e..901d3c6 100644
      k: tl.constexpr,
      NMAX: tl.constexpr,
      NMIN: tl.constexpr,
-@@ -67,8 +68,11 @@ def _suffix_lookup_kernel(
+@@ -67,8 +68,11 @@
  
      # Candidate match ends run over [lo, hi): any position before the suffix's own end.
      # A candidate may overlap the suffix (a period-p repetition matches at e = t - p),
@@ -301,7 +301,7 @@ index 0315b6e..901d3c6 100644
      lo = tl.maximum(NMIN - 1, total_len - search_max)
      best = tl.full([], -1, tl.int64)
      for start in range(lo, hi, BLOCK):
-@@ -243,6 +247,7 @@ def suffix_lookup(
+@@ -243,6 +247,7 @@
      nmax: int = 32,
      nmin: int = 4,
      search_max: int = 1 << 30,
@@ -309,7 +309,7 @@ index 0315b6e..901d3c6 100644
      out_tokens: torch.Tensor | None = None,
      out_len: torch.Tensor | None = None,
      out_valid: torch.Tensor | None = None,
-@@ -270,6 +275,7 @@ def suffix_lookup(
+@@ -270,6 +275,7 @@
          out_len,
          out_valid,
          search_max,
@@ -318,10 +318,10 @@ index 0315b6e..901d3c6 100644
          NMAX=nmax,
          NMIN=nmin,
 diff --git a/v1/worker/gpu_model_runner.py b/v1/worker/gpu_model_runner.py
-index e6ba7bc..22ddbc5 100644
+index 1090466..4820212 100644
 --- a/v1/worker/gpu_model_runner.py
 +++ b/v1/worker/gpu_model_runner.py
-@@ -5266,6 +5266,15 @@ class GPUModelRunner(
+@@ -5142,6 +5142,15 @@
                      next_token_ids, valid_sampled_tokens_count
                  )
  

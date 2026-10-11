@@ -1,14 +1,15 @@
 # patches-turing/
 
-The Turing (SM75) series: 22 patches applied after `patches/`, in the order
-listed in `series`, on the same vLLM 0.29.0 pin. Same install recipe, one
+The Turing (SM75) series: 21 patches applied after `patches/`, in the order
+listed in `series`, on the same vLLM 0.31.0 pin. Same install recipe, one
 generation of hardware older: a 22 GB RTX 2080 Ti running the serving setup
 this repo is built for.
 
-Regenerated against `upstream/main` at `1cf8665` (the vLLM 0.29.0 pin plus
-upstream's series hygiene), with the full `patches/` series already applied.
-The stop-by-stop record of the 0.28.0 -> 0.29.0 rebase is in
-[docs/turing-0.29-port.md](../docs/turing-0.29-port.md).
+Regenerated against `upstream/main` at `3512f0e` (the vLLM 0.31.0 pin), with the
+full `patches/` series already applied. The stop-by-stop record of the
+0.29.0 -> 0.31.0 rebase is in
+[docs/turing-0.31-port.md](../docs/turing-0.31-port.md); the 0.28.0 -> 0.29.0
+one is in [docs/turing-0.29-port.md](../docs/turing-0.29-port.md).
 
 `series` is explicit rather than glob order, because the two directories are
 applied one after the other and the file names here do not have to sort after
@@ -17,11 +18,11 @@ applied one after the other and the file names here do not have to sort after
 To check the whole stack against a pristine checkout (this is what CI runs):
 
 ```bash
-git clone --depth 1 --branch v0.29.0 https://github.com/vllm-project/vllm /tmp/vllm
+git clone --depth 1 --branch v0.31.0 https://github.com/vllm-project/vllm /tmp/vllm
 bash patches-turing/check_vllm_series.sh /tmp/vllm/vllm
 ```
 
-To install it, boot a vLLM 0.29.0 environment and apply both directories, the
+To install it, boot a vLLM 0.31.0 environment and apply both directories, the
 3090 series first, both at `--fuzz 0`:
 
 ```bash
@@ -48,6 +49,12 @@ re-add them:
 | `vllm-engine-completion-log.patch` | `patches/engine-completion-log.patch` |
 | `vllm-engine-stall-sentinel.patch` | `patches/engine-stall-sentinel.patch` |
 | `vllm-sse-keep-alive.patch` | native in vLLM 0.29.0 (`entrypoints/openai/sse_keep_alive.py`) |
+
+## Retired at the 0.31 port
+
+| retired | now provided by |
+| --- | --- |
+| `mtp-prefix-checkpoint.patch` | upstream 0.31's own checkpoint alignment: the hybrid coordinator sets `drop_eagle_checkpoint_block` on the Mamba manager when the scheduler drops Eagle's last hash unit (`use_eagle_block_drop`), `MambaManager` shifts `latest_prompt_hash_boundary` down one unit for it, and `is_mamba_prefill_checkpoint_valid(...)` with the `num_prefill_lookahead` plumbing enforces the same "a physical-page boundary must not leave fewer known inputs than the draft lookahead" rule the patch carried. |
 
 The tail patch `envs-knobs.patch` registers the Turing series' knobs in
 `envs.py` and reads them through `envs`, matching upstream's

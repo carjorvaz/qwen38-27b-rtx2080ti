@@ -8,10 +8,10 @@ subclasses with their own initialization keep their original range, and the
 embedding table stays shared with the target after loading.
 
 diff --git a/model_executor/layers/vocab_parallel_embedding.py b/model_executor/layers/vocab_parallel_embedding.py
-index 70c6516..37c6f0a 100644
+index be20c41..d6d122a 100644
 --- a/model_executor/layers/vocab_parallel_embedding.py
 +++ b/model_executor/layers/vocab_parallel_embedding.py
-@@ -498,7 +498,21 @@ class VocabParallelEmbedding(PluggableLayer):
+@@ -517,7 +517,21 @@
  
      def forward(self, input_):
          if self.tp_size == 1:
@@ -35,10 +35,10 @@ index 70c6516..37c6f0a 100644
          if self.use_fused_embedding:
              output_parallel = ops.vocab_parallel_embedding(
 diff --git a/model_executor/models/qwen3_dflash.py b/model_executor/models/qwen3_dflash.py
-index d38adfc..a6ff712 100644
+index cb6f07f..09ff612 100644
 --- a/model_executor/models/qwen3_dflash.py
 +++ b/model_executor/models/qwen3_dflash.py
-@@ -389,6 +389,8 @@ def _dense_kv_rows(attn: nn.Module) -> torch.Tensor:
+@@ -425,6 +425,8 @@
  @support_torch_compile
  class DFlashQwen3Model(nn.Module):
      decoder_layer_cls = DFlashQwen3DecoderLayer
@@ -47,10 +47,10 @@ index d38adfc..a6ff712 100644
  
      hf_to_vllm_mapper = WeightsMapper(
          orig_to_new_substr={
-@@ -419,6 +421,14 @@ class DFlashQwen3Model(nn.Module):
-         self.config = vllm_config.speculative_config.draft_model_config.hf_config
-         self.vocab_size = self.config.vocab_size
-         self.quant_config = get_draft_quant_config(vllm_config)
+@@ -460,6 +462,14 @@
+         _add_global_draft_layer_exclusions(
+             self.quant_config, start_layer_id, self.config.num_hidden_layers
+         )
 +        # BF16-trained residuals can overflow FP16 before the next pre-norm.
 +        # A power-of-two change of units preserves normalized activations without
 +        # changing Q/K/V, MLP gate/up, convolution, or selector weights.
@@ -62,7 +62,7 @@ index d38adfc..a6ff712 100644
  
          drafter_config = getattr(self.config, "eagle_config", {})
          drafter_config.update(getattr(self.config, "dflash_config", {}))
-@@ -483,6 +493,17 @@ class DFlashQwen3Model(nn.Module):
+@@ -524,6 +534,17 @@
              self.config.hidden_size,
              eps=self.config.rms_norm_eps,
          )
@@ -80,7 +80,7 @@ index d38adfc..a6ff712 100644
  
      def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
          embeds = self.embed_tokens(input_ids)
-@@ -490,6 +511,10 @@ class DFlashQwen3Model(nn.Module):
+@@ -531,6 +552,10 @@
              # Replace masked slots with the dedicated mask embedding.
              is_mask = (input_ids == self.mask_token_id).unsqueeze(-1)
              embeds = torch.where(is_mask, self.mask_embedding.to(embeds.dtype), embeds)
@@ -91,15 +91,15 @@ index d38adfc..a6ff712 100644
          return embeds
  
      def _build_context_kv_buffers(
-@@ -498,6 +523,7 @@ class DFlashQwen3Model(nn.Module):
+@@ -539,6 +564,7 @@
          has_bias: bool,
      ) -> None:
          self._hidden_norm_weight = self.hidden_norm.weight.data
 +        self._hidden_norm_eps = self.hidden_norm.variance_epsilon
+         self._context_qkv_projs = [a.qkv_proj for a in layers_attn]
+         self._context_q_sizes = [a.q_size for a in layers_attn]
  
-         # KV projection weights: [num_layers * 2 * kv_size, hidden_size]
-         kv_weights = [_dense_kv_rows(a) for a in layers_attn]
-@@ -544,14 +570,16 @@ class DFlashQwen3Model(nn.Module):
+@@ -588,14 +614,16 @@
          self._kv_size = attn0.kv_size
          self._head_dim = attn0.head_dim
          self._num_kv_heads = attn0.num_kv_heads
@@ -118,16 +118,16 @@ index d38adfc..a6ff712 100644
              ), "All layers must have the same attn config for DFlash precomputation"
  
          # References to inner Attention layers for direct cache writes
-@@ -571,7 +599,7 @@ class DFlashQwen3Model(nn.Module):
+@@ -615,7 +643,7 @@
              normed_context_states,
              context_states,
              self._hidden_norm_weight,
 -            self._rms_norm_eps,
 +            self._hidden_norm_eps,
          )
-         all_kv_flat = F.linear(
-             normed_context_states, self._fused_kv_weight, self._fused_kv_bias
-@@ -700,6 +728,35 @@ class DFlashQwen3Model(nn.Module):
+         if self._fused_kv_weight is not None:
+             all_kv_flat = F.linear(
+@@ -766,6 +794,35 @@
          tp_size = get_tensor_model_parallel_world_size()
          tp_rank = get_tensor_model_parallel_rank()
          for name, loaded_weight in weights:
@@ -163,7 +163,7 @@ index d38adfc..a6ff712 100644
              if "attention_sink_bias" in name:
                  # Sink bias is per-head; shard it across TP ranks like the
                  # attention heads themselves.
-@@ -712,7 +769,7 @@ class DFlashQwen3Model(nn.Module):
+@@ -778,7 +835,7 @@
      def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
          loader = AutoWeightsLoader(self)
          return loader.load_weights(

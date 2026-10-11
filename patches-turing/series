@@ -16,7 +16,6 @@ gdn-chunk-state.patch
 gdn-state-16w.patch
 spec-decode-mma.patch
 mtp-history-lookup.patch
-mtp-prefix-checkpoint.patch
 packed-int4-kv.patch
 prefill-attn-dispatch.patch
 prefill-attn-tiles.patch
